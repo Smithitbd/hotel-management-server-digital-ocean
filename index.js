@@ -1,4 +1,3 @@
-// Force Node.js to use Google and Cloudflare public DNS resolvers
 require("node:dns").setServers(["8.8.8.8", "1.1.1.1"]);
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -9,15 +8,16 @@ const fileUpload = require("express-fileupload");
 const path = require("path");
 const fs = require("fs");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
-// ========== MODULAR FIREBASE ADMIN ==========
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 
 dotenv.config();
 
-
-const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8",
+);
 const serviceAccount = JSON.parse(decoded);
 
 initializeApp({
@@ -25,19 +25,15 @@ initializeApp({
 });
 
 const auth = getAuth();
-// ============================================
-
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 app.use(fileUpload());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// MongoDB Connection URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.vacfvah.mongodb.net/?appName=Cluster0`;
 
 const client = new MongoClient(uri, {
@@ -52,9 +48,6 @@ async function run() {
   try {
     await client.connect();
 
-    // =========================================================
-    // ALL COLLECTIONS
-    // =========================================================
     const db = client.db("Hotel_Management_Software");
 
     const employeeCollection = db.collection("Employees");
@@ -78,6 +71,129 @@ async function run() {
     const usersCollection = db.collection("Users");
 
     // =========================================================
+    // JWT
+    // =========================================================
+    app.post("/jwt", async (req, res) => {
+      const { email } = req.body;
+      if (!email) {
+        return res.status(400).send({ message: "Email is required" });
+      }
+
+      const token = jwt.sign({ email }, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: "7d",
+      });
+
+      res.send({ token });
+    });
+
+    const verifyToken = (req, res, next) => {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) {
+        return res.status(401).send({ message: "404 Not Found" });
+        // return res.status(401).send({ message: "Unauthorized access" });
+      }
+
+      const token = authHeader.split(" ")[1];
+
+      jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+        if (err) {
+          return res.status(403).send({ message: "Forbidden access" });
+        }
+        req.decoded = decoded;
+        next();
+      });
+    };
+
+    // Dashboard: status === "Admin" → Settings only (hotel list / approve / delete)
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const hotel = await hotelCollection.findOne({
+          email: req.decoded.email,
+        });
+
+        if (!hotel || hotel.status !== "Admin") {
+          return res.status(403).send({ message: "Forbidden: Admin only" });
+        }
+
+        req.userType = "admin";
+        req.hotelEmail = hotel.email;
+        next();
+      } catch (error) {
+        res.status(500).send({ message: "Failed to verify admin" });
+      }
+    };
+
+    // Dashboard: status === "Approved"
+    // owner + sub-user → Dashboard, Rooms, Services, Billing,
+    // Check In & Out, Guests, Reservations, Settings
+    const verifyHotelUser = async (req, res, next) => {
+      try {
+        const email = req.decoded.email;
+
+        const hotel = await hotelCollection.findOne({ email });
+        if (hotel && hotel.status === "Approved") {
+          req.userType = "owner";
+          req.hotelEmail = hotel.email;
+          return next();
+        }
+
+        const subUser = await usersCollection.findOne({
+          $or: [{ email1: email }, { email2: email }],
+        });
+
+        if (subUser && subUser.status === "Approved") {
+          req.userType = "sub-user";
+          req.hotelEmail = subUser.hotelEmail;
+          return next();
+        }
+
+        return res
+          .status(403)
+          .send({ message: "Forbidden: Approved hotel user only" });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to verify user" });
+      }
+    };
+
+    // Dashboard: status === "Approved" && type !== "sub-user"
+    // Employees + Reports
+    // Also owner settings mutations (logo / hotel patch)
+    // Admin can use the same routes from Settings
+    const verifyOwnerOrAdmin = async (req, res, next) => {
+      try {
+        const hotel = await hotelCollection.findOne({
+          email: req.decoded.email,
+        });
+
+        if (hotel && hotel.status === "Approved") {
+          req.userType = "owner";
+          req.hotelEmail = hotel.email;
+          return next();
+        }
+
+        if (hotel && hotel.status === "Admin") {
+          req.userType = "admin";
+          req.hotelEmail = hotel.email;
+          return next();
+        }
+
+        return res
+          .status(403)
+          .send({ message: "Forbidden: Owner or admin only" });
+      } catch (error) {
+        res.status(500).send({ message: "Failed to verify owner or admin" });
+      }
+    };
+
+    const assertSameHotel = (req, res, hotelEmail) => {
+      if (hotelEmail && req.hotelEmail && hotelEmail !== req.hotelEmail) {
+        res.status(403).send({ message: "Forbidden access" });
+        return false;
+      }
+      return true;
+    };
+
+    // =========================================================
     // ROOT
     // =========================================================
     app.get("/", (req, res) => {
@@ -85,359 +201,473 @@ async function run() {
     });
 
     // =========================================================
-    // DASHBOARD STATS
+    // USER STATUS (token required, own email or admin)
     // =========================================================
-    app.get("/dashboard/stats", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-
-      const currentGuests = await checkInCollection.countDocuments({
-        hotelEmail,
-        status: { $ne: "Checked Out" },
-      });
-
-      const currentEmployees = await employeeCollection.countDocuments({
-        hotelEmail,
-        EmploymentStatus: { $in: ["Active", "On Leave"] },
-      });
-
-      const totalAvailableRooms = await roomCollection.countDocuments({
-        hotelEmail,
-        roomStatus: "Available",
-      });
-
-      const totalOccupiedRooms = await roomCollection.countDocuments({
-        hotelEmail,
-        roomStatus: "Occupied",
-      });
-
-      const now = new Date();
-      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-      const endOfMonth = new Date(
-        now.getFullYear(),
-        now.getMonth() + 1,
-        0,
-        23,
-        59,
-        59,
-      );
-
-      const thisMonthCheckouts = await checkOutCollection
-        .find({
-          hotelEmail,
-          checkedOutAt: {
-            $gte: startOfMonth,
-            $lte: endOfMonth,
-          },
-        })
-        .toArray();
-
-      const currentMonthEarning = thisMonthCheckouts.reduce((sum, item) => {
-        return sum + (Number(item.totalCharges) || 0);
-      }, 0);
-
-      res.send({
-        currentGuests,
-        currentEmployees,
-        totalAvailableRooms,
-        totalOccupiedRooms,
-        currentMonthEarning,
-      });
-    });
-
-    // =========================================================
-    // CUSTOMERS PER MONTH
-    // =========================================================
-    app.get("/dashboard/customers-per-month", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-
-      const checkouts = await checkOutCollection.find({ hotelEmail }).toArray();
-
-      const monthlyCount = {};
-
-      checkouts.forEach((item) => {
-        const date = new Date(item.checkedOutAt || item.createdAt);
-        const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-        monthlyCount[key] = (monthlyCount[key] || 0) + 1;
-      });
-
-      const sortedKeys = Object.keys(monthlyCount).sort();
-
-      const categories = sortedKeys.map((key) => {
-        const [year, month] = key.split("-");
-        const monthNames = [
-          "Jan",
-          "Feb",
-          "Mar",
-          "Apr",
-          "May",
-          "Jun",
-          "Jul",
-          "Aug",
-          "Sep",
-          "Oct",
-          "Nov",
-          "Dec",
-        ];
-        return `${monthNames[parseInt(month) - 1]} ${year}`;
-      });
-
-      const seriesData = sortedKeys.map((key) => monthlyCount[key]);
-
-      res.send({
-        categories,
-        series: [{ name: "Customers", data: seriesData }],
-      });
-    });
-
-    // =========================================================
-    // REVENUE BY SERVICE
-    // =========================================================
-    app.get("/dashboard/revenue-by-service", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-
-      const checkouts = await checkOutCollection.find({ hotelEmail }).toArray();
-
-      let restaurantRevenue = 0;
-      let laundryRevenue = 0;
-      let transportRevenue = 0;
-      let roomRevenue = 0;
-
-      checkouts.forEach((item) => {
-        roomRevenue += Number(item.actualRoomCharge || item.totalAmount || 0);
-
-        (item.restaurantOrders || []).forEach((order) => {
-          restaurantRevenue += Number(order.totalAmount || 0);
-        });
-
-        (item.laundryOrders || []).forEach((order) => {
-          laundryRevenue += Number(order.totalCost || 0);
-        });
-
-        (item.transportOrders || []).forEach((order) => {
-          transportRevenue += Number(order.fare || 0);
-        });
-      });
-
-      res.send({
-        labels: ["Room", "Restaurant", "Laundry", "Transport"],
-        series: [
-          roomRevenue,
-          restaurantRevenue,
-          laundryRevenue,
-          transportRevenue,
-        ],
-      });
-    });
-    // =========================================================
-    // EMPLOYEES
-    // =========================================================
-    app.post("/employees", async (req, res) => {
+    app.get("/users/:email/status", verifyToken, async (req, res) => {
       try {
-        if (!req.files || !req.files.image) {
-          return res.status(400).json({ message: "Profile photo is required" });
+        const email = req.params.email;
+
+        if (req.decoded.email !== email) {
+          const requesterHotel = await hotelCollection.findOne({
+            email: req.decoded.email,
+          });
+          if (requesterHotel?.status !== "Admin") {
+            return res.status(403).send({ message: "Forbidden access" });
+          }
         }
 
-        const image = req.files.image;
+        const hotel = await hotelCollection.findOne(
+          { email },
+          { projection: { status: 1, email: 1, hotelName: 1 } },
+        );
 
-        if (!image.mimetype.startsWith("image/")) {
-          return res
-            .status(400)
-            .json({ message: "Only image files are allowed" });
+        if (hotel) {
+          return res.send({
+            status: hotel.status,
+            type: hotel.status === "Admin" ? "admin" : "owner",
+            hotelEmail: hotel.email,
+            hotelName: hotel.hotelName || null,
+          });
         }
 
-        const uploadDir = path.join(__dirname, "uploads", "employees");
-        if (!fs.existsSync(uploadDir)) {
-          fs.mkdirSync(uploadDir, { recursive: true });
+        const subUser = await usersCollection.findOne({
+          $or: [{ email1: email }, { email2: email }],
+        });
+
+        if (subUser) {
+          return res.send({
+            status: subUser.status,
+            type: "sub-user",
+            hotelEmail: subUser.hotelEmail,
+            hotelName: subUser.hotelName,
+          });
         }
 
-        const uniqueName =
-          Date.now() +
-          "-" +
-          Math.round(Math.random() * 1e9) +
-          path.extname(image.name);
-
-        await image.mv(path.join(uploadDir, uniqueName));
-
-        const employee = {
-          FullName: req.body.FullName,
-          EmployeeID: req.body.EmployeeID,
-          Email: req.body.Email,
-          Phone: req.body.Phone,
-          NID: req.body.NID,
-          Gender: req.body.Gender,
-          Department: req.body.Department,
-          Designation: req.body.Designation,
-          JoiningDate: req.body.JoiningDate,
-          EmploymentStatus: req.body.EmploymentStatus,
-          Address: req.body.Address,
-          Image: `/uploads/employees/${uniqueName}`,
-          createdAt: new Date(),
-          hotelEmail: req.body.hotelEmail,
-        };
-
-        const result = await employeeCollection.insertOne(employee);
-        res.status(201).send(result);
+        return res.status(404).send({ status: "Pending" });
       } catch (error) {
-        console.error("Add employee error:", error);
-        res.status(500).send({ message: "Failed to add employee" });
+        console.error(error);
+        res.status(500).send({ message: "Failed to get status" });
       }
     });
 
-    app.get("/employees/active", async (req, res) => {
-      const { hotelEmail } = req.query;
-      const employees = await employeeCollection
-        .find({
+    // =========================================================
+    // DASHBOARD STATS — Approved + Admin + sub-user
+    // =========================================================
+    app.get(
+      "/dashboard/stats",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+
+        const currentGuests = await checkInCollection.countDocuments({
+          hotelEmail,
+          status: { $ne: "Checked Out" },
+        });
+
+        const currentEmployees = await employeeCollection.countDocuments({
           hotelEmail,
           EmploymentStatus: { $in: ["Active", "On Leave"] },
-        })
-        .toArray();
-      res.send(employees);
-    });
+        });
 
-    app.get("/employees/inactive", async (req, res) => {
-      const { hotelEmail } = req.query;
-      const employees = await employeeCollection
-        .find({
+        const totalAvailableRooms = await roomCollection.countDocuments({
           hotelEmail,
-          EmploymentStatus: { $in: ["Resigned", "Terminated"] },
-        })
-        .toArray();
-      res.send(employees);
-    });
+          roomStatus: "Available",
+        });
 
-    app.get("/employees/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid employee ID" });
-      }
-      const employee = await employeeCollection.findOne({
-        _id: new ObjectId(id),
+        const totalOccupiedRooms = await roomCollection.countDocuments({
+          hotelEmail,
+          roomStatus: "Occupied",
+        });
+
+        const now = new Date();
+        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const endOfMonth = new Date(
+          now.getFullYear(),
+          now.getMonth() + 1,
+          0,
+          23,
+          59,
+          59,
+        );
+
+        const thisMonthCheckouts = await checkOutCollection
+          .find({
+            hotelEmail,
+            checkedOutAt: {
+              $gte: startOfMonth,
+              $lte: endOfMonth,
+            },
+          })
+          .toArray();
+
+        const currentMonthEarning = thisMonthCheckouts.reduce((sum, item) => {
+          return sum + (Number(item.totalCharges) || 0);
+        }, 0);
+
+        res.send({
+          currentGuests,
+          currentEmployees,
+          totalAvailableRooms,
+          totalOccupiedRooms,
+          currentMonthEarning,
+        });
+      },
+    );
+
+    app.get(
+      "/dashboard/customers-per-month",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+
+        const checkouts = await checkOutCollection
+          .find({ hotelEmail })
+          .toArray();
+
+        const monthlyCount = {};
+
+        checkouts.forEach((item) => {
+          const date = new Date(item.checkedOutAt || item.createdAt);
+          const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+          monthlyCount[key] = (monthlyCount[key] || 0) + 1;
+        });
+
+        const sortedKeys = Object.keys(monthlyCount).sort();
+
+        const categories = sortedKeys.map((key) => {
+          const [year, month] = key.split("-");
+          const monthNames = [
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun",
+            "Jul",
+            "Aug",
+            "Sep",
+            "Oct",
+            "Nov",
+            "Dec",
+          ];
+          return `${monthNames[parseInt(month) - 1]} ${year}`;
+        });
+
+        const seriesData = sortedKeys.map((key) => monthlyCount[key]);
+
+        res.send({
+          categories,
+          series: [{ name: "Customers", data: seriesData }],
+        });
+      },
+    );
+
+    app.get(
+      "/dashboard/revenue-by-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+
+        const checkouts = await checkOutCollection
+          .find({ hotelEmail })
+          .toArray();
+
+        let restaurantRevenue = 0;
+        let laundryRevenue = 0;
+        let transportRevenue = 0;
+        let roomRevenue = 0;
+
+        checkouts.forEach((item) => {
+          roomRevenue += Number(item.actualRoomCharge || item.totalAmount || 0);
+
+          (item.restaurantOrders || []).forEach((order) => {
+            restaurantRevenue += Number(order.totalAmount || 0);
+          });
+
+          (item.laundryOrders || []).forEach((order) => {
+            laundryRevenue += Number(order.totalCost || 0);
+          });
+
+          (item.transportOrders || []).forEach((order) => {
+            transportRevenue += Number(order.fare || 0);
+          });
+        });
+
+        res.send({
+          labels: ["Room", "Restaurant", "Laundry", "Transport"],
+          series: [
+            roomRevenue,
+            restaurantRevenue,
+            laundryRevenue,
+            transportRevenue,
+          ],
+        });
+      },
+    );
+
+    // =========================================================
+    // EMPLOYEES — owner / admin only (hidden from sub-user)
+    // =========================================================
+    app.post(
+      "/employees",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          if (!req.files || !req.files.image) {
+            return res
+              .status(400)
+              .json({ message: "Profile photo is required" });
+          }
+
+          const image = req.files.image;
+
+          if (!image.mimetype.startsWith("image/")) {
+            return res
+              .status(400)
+              .json({ message: "Only image files are allowed" });
+          }
+
+          const uploadDir = path.join(__dirname, "uploads", "employees");
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+          }
+
+          const uniqueName =
+            Date.now() +
+            "-" +
+            Math.round(Math.random() * 1e9) +
+            path.extname(image.name);
+
+          await image.mv(path.join(uploadDir, uniqueName));
+
+          const employee = {
+            FullName: req.body.FullName,
+            EmployeeID: req.body.EmployeeID,
+            Email: req.body.Email,
+            Phone: req.body.Phone,
+            NID: req.body.NID,
+            Gender: req.body.Gender,
+            Department: req.body.Department,
+            Designation: req.body.Designation,
+            JoiningDate: req.body.JoiningDate,
+            EmploymentStatus: req.body.EmploymentStatus,
+            Address: req.body.Address,
+            Image: `/uploads/employees/${uniqueName}`,
+            createdAt: new Date(),
+            hotelEmail: req.body.hotelEmail || req.hotelEmail,
+          };
+
+          const result = await employeeCollection.insertOne(employee);
+          res.status(201).send(result);
+        } catch (error) {
+          console.error("Add employee error:", error);
+          res.status(500).send({ message: "Failed to add employee" });
+        }
+      },
+    );
+
+    app.get(
+      "/employees/active",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const employees = await employeeCollection
+          .find({
+            hotelEmail,
+            EmploymentStatus: { $in: ["Active", "On Leave"] },
+          })
+          .toArray();
+        res.send(employees);
+      },
+    );
+
+    app.get(
+      "/employees/inactive",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const employees = await employeeCollection
+          .find({
+            hotelEmail,
+            EmploymentStatus: { $in: ["Resigned", "Terminated"] },
+          })
+          .toArray();
+        res.send(employees);
+      },
+    );
+
+    app.get(
+      "/employees/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid employee ID" });
+        }
+        const employee = await employeeCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        res.send(employee);
+      },
+    );
+
+    app.patch(
+      "/employees/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { _id, ...updatedData } = req.body;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid employee ID" });
+        }
+        const result = await employeeCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updatedData },
+        );
+        res.send(result);
+      },
+    );
+
+    // =========================================================
+    // ROOMS — Approved + Admin + sub-user
+    // =========================================================
+    app.post("/rooms", verifyToken, verifyHotelUser, async (req, res) => {
+      const result = await roomCollection.insertOne({
+        ...req.body,
+        hotelEmail: req.body.hotelEmail || req.hotelEmail,
       });
-      res.send(employee);
-    });
-
-    app.patch("/employees/:id", async (req, res) => {
-      const { id } = req.params;
-      const { _id, ...updatedData } = req.body;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid employee ID" });
-      }
-      const result = await employeeCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: updatedData },
-      );
-      res.send(result);
-    });
-
-    // =========================================================
-    // ROOMS
-    // =========================================================
-    app.post("/rooms", async (req, res) => {
-      const result = await roomCollection.insertOne(req.body);
       res.status(201).send(result);
     });
 
-    app.get("/rooms", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
+    app.get("/rooms", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const rooms = await roomCollection.find({ hotelEmail }).toArray();
       res.send(rooms);
     });
 
-    app.get("/rooms/maintenance", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
+    app.get(
+      "/rooms/maintenance",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
 
-      const query = {
-        roomStatus: { $in: ["Maintenance", "In Progress"] },
-      };
-
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-
-      const rooms = await roomCollection.find(query).toArray();
-      res.send(rooms);
-    });
-
-    app.get("/rooms/maintenance/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room ID" });
-      }
-      const room = await roomCollection.findOne({
-        _id: new ObjectId(id),
-        roomStatus: { $in: ["Maintenance", "In Progress"] },
-      });
-      res.send(room);
-    });
-
-    app.get("/rooms/available", async (req, res) => {
-      const { arriving, departure, hotelEmail } = req.query;
-
-      if (!arriving || !departure) {
-        return res.status(400).send({ message: "Dates required" });
-      }
-
-      // Correct overlap logic
-      const checkIns = await checkInCollection
-        .find({
+        const query = {
+          roomStatus: { $in: ["Maintenance", "In Progress"] },
           hotelEmail,
-          checkInDate: { $lte: departure },
-          checkOutDate: { $gt: arriving },
-        })
-        .toArray();
+        };
 
-      const reservations = await reservationCollection
-        .find({
-          hotelEmail,
-          arrivingDate: { $lte: departure },
-          departureDate: { $gt: arriving },
-          status: "Reserved",
-        })
-        .toArray();
+        const rooms = await roomCollection.find(query).toArray();
+        res.send(rooms);
+      },
+    );
 
-      const blocked = [
-        ...new Set([
-          ...checkIns.map((c) => String(c.roomNumber)),
-          ...reservations.map((r) => String(r.room?.roomNo || r.roomNo)),
-        ]),
-      ];
-
-      const rooms = await roomCollection
-        .find({
-          hotelEmail,
-          roomNo: { $nin: blocked },
-          roomStatus: { $ne: "Maintenance" },
-        })
-        .toArray();
-
-      const grouped = {};
-      rooms.forEach((room) => {
-        const name = room.variantName || "Other";
-        if (!grouped[name]) {
-          grouped[name] = {
-            variantName: room.variantName,
-            baseRoomType: room.baseRoomType,
-            price: room.price,
-            maxOccupancy: room.maxOccupancy,
-            bedType: room.bedType,
-            amenities: room.amenities,
-            description: room.description,
-            image: room.image,
-            rooms: [],
-          };
+    app.get(
+      "/rooms/maintenance/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room ID" });
         }
-        grouped[name].rooms.push(room);
-      });
+        const room = await roomCollection.findOne({
+          _id: new ObjectId(id),
+          roomStatus: { $in: ["Maintenance", "In Progress"] },
+        });
+        res.send(room);
+      },
+    );
 
-      res.send({
-        arriving,
-        departure,
-        totalAvailable: rooms.length,
-        variants: Object.values(grouped),
-      });
-    });
+    app.get(
+      "/rooms/available",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { arriving, departure } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
 
-    app.get("/rooms/:id", async (req, res) => {
+        if (!arriving || !departure) {
+          return res.status(400).send({ message: "Dates required" });
+        }
+
+        const checkIns = await checkInCollection
+          .find({
+            hotelEmail,
+            checkInDate: { $lte: departure },
+            checkOutDate: { $gt: arriving },
+          })
+          .toArray();
+
+        const reservations = await reservationCollection
+          .find({
+            hotelEmail,
+            arrivingDate: { $lte: departure },
+            departureDate: { $gt: arriving },
+            status: "Reserved",
+          })
+          .toArray();
+
+        const blocked = [
+          ...new Set([
+            ...checkIns.map((c) => String(c.roomNumber)),
+            ...reservations.map((r) => String(r.room?.roomNo || r.roomNo)),
+          ]),
+        ];
+
+        const rooms = await roomCollection
+          .find({
+            hotelEmail,
+            roomNo: { $nin: blocked },
+            roomStatus: { $ne: "Maintenance" },
+          })
+          .toArray();
+
+        const grouped = {};
+        rooms.forEach((room) => {
+          const name = room.variantName || "Other";
+          if (!grouped[name]) {
+            grouped[name] = {
+              variantName: room.variantName,
+              baseRoomType: room.baseRoomType,
+              price: room.price,
+              maxOccupancy: room.maxOccupancy,
+              bedType: room.bedType,
+              amenities: room.amenities,
+              description: room.description,
+              image: room.image,
+              rooms: [],
+            };
+          }
+          grouped[name].rooms.push(room);
+        });
+
+        res.send({
+          arriving,
+          departure,
+          totalAvailable: rooms.length,
+          variants: Object.values(grouped),
+        });
+      },
+    );
+
+    app.get("/rooms/:id", verifyToken, verifyHotelUser, async (req, res) => {
       const { id } = req.params;
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid room ID" });
@@ -446,7 +676,7 @@ async function run() {
       res.send(result);
     });
 
-    app.patch("/rooms/:id", async (req, res) => {
+    app.patch("/rooms/:id", verifyToken, verifyHotelUser, async (req, res) => {
       const { id } = req.params;
       const { _id, ...updateData } = req.body;
       if (!ObjectId.isValid(id)) {
@@ -459,191 +689,142 @@ async function run() {
       res.send(result);
     });
 
-    app.delete("/room-delete/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room ID" });
-      }
-      const result = await roomCollection.deleteOne({ _id: new ObjectId(id) });
-      res.send(result);
-    });
+    app.delete(
+      "/room-delete/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room ID" });
+        }
+        const result = await roomCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      },
+    );
 
     // =========================================================
     // MAINTENANCE HISTORY
     // =========================================================
-    app.get("/maintenance-history", async (req, res) => {
-      const result = await maintenanceHistoryCollection.find().toArray();
-      res.send(result);
-    });
+    app.get(
+      "/maintenance-history",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const result = await maintenanceHistoryCollection.find().toArray();
+        res.send(result);
+      },
+    );
 
-    app.get("/maintenance-history/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res
-          .status(400)
-          .send({ message: "Invalid maintenance history ID" });
-      }
-      const result = await maintenanceHistoryCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      res.send(result);
-    });
-
-    app.patch("/edit-maintenance-history/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room ID" });
-      }
-
-      const { _id, ...cleanData } = req.body;
-
-      const room_res = await roomCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: cleanData },
-      );
-
-      let history_res = null;
-      if (cleanData.roomStatus === "Available") {
-        history_res = await maintenanceHistoryCollection.insertOne({
-          ...cleanData,
-          roomID: new ObjectId(id),
-          closedAt: new Date(),
+    app.get(
+      "/maintenance-history/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .send({ message: "Invalid maintenance history ID" });
+        }
+        const result = await maintenanceHistoryCollection.findOne({
+          _id: new ObjectId(id),
         });
-      }
+        res.send(result);
+      },
+    );
 
-      res.send({
-        success: true,
-        message: "Room updated successfully",
-        history_res,
-        room_res,
-      });
-    });
+    app.patch(
+      "/edit-maintenance-history/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room ID" });
+        }
 
-    app.patch("/change-maintenance-history/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res
-          .status(400)
-          .send({ message: "Invalid maintenance history ID" });
-      }
-      const { _id, ...updateData } = req.body;
-      const result = await maintenanceHistoryCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: updateData },
-      );
-      res.send({
-        success: true,
-        message: "Maintenance history updated successfully",
-        result,
-      });
-    });
+        const { _id, ...cleanData } = req.body;
 
-    app.delete("/maintenance-history/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res
-          .status(400)
-          .send({ message: "Invalid maintenance history ID" });
-      }
-      const result = await maintenanceHistoryCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-      res.send(result);
-    });
+        const room_res = await roomCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: cleanData },
+        );
+
+        let history_res = null;
+        if (cleanData.roomStatus === "Available") {
+          history_res = await maintenanceHistoryCollection.insertOne({
+            ...cleanData,
+            roomID: new ObjectId(id),
+            closedAt: new Date(),
+          });
+        }
+
+        res.send({
+          success: true,
+          message: "Room updated successfully",
+          history_res,
+          room_res,
+        });
+      },
+    );
+
+    app.patch(
+      "/change-maintenance-history/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .send({ message: "Invalid maintenance history ID" });
+        }
+        const { _id, ...updateData } = req.body;
+        const result = await maintenanceHistoryCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData },
+        );
+        res.send({
+          success: true,
+          message: "Maintenance history updated successfully",
+          result,
+        });
+      },
+    );
+
+    app.delete(
+      "/maintenance-history/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .send({ message: "Invalid maintenance history ID" });
+        }
+        const result = await maintenanceHistoryCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      },
+    );
 
     // =========================================================
     // ROOM VARIANTS
     // =========================================================
-    app.post("/add-room-variant", async (req, res) => {
-      if (!req.files || !req.files.image) {
-        return res.status(400).json({ message: "Image is required" });
-      }
+    app.post(
+      "/add-room-variant",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        if (!req.files || !req.files.image) {
+          return res.status(400).json({ message: "Image is required" });
+        }
 
-      const image = req.files.image;
-      if (!image.mimetype.startsWith("image/")) {
-        return res
-          .status(400)
-          .json({ message: "Only image files are allowed" });
-      }
-
-      const uploadDir = path.join(__dirname, "uploads", "room-variants");
-      if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
-      }
-
-      const uniqueName =
-        Date.now() +
-        "-" +
-        Math.round(Math.random() * 1e9) +
-        path.extname(image.name);
-
-      await image.mv(path.join(uploadDir, uniqueName));
-
-      const roomVariant = {
-        variantName: req.body.variantName,
-        baseRoomType: req.body.baseRoomType,
-        price: Number(req.body.price),
-        maxOccupancy: Number(req.body.maxOccupancy),
-        bedType: req.body.bedType || "",
-        amenities: req.body.amenities || "",
-        description: req.body.description || "",
-        image: `/uploads/room-variants/${uniqueName}`,
-        createdAt: new Date(),
-        hotelEmail: req.body.hotelEmail,
-      };
-
-      const result = await roomVariantCollection.insertOne(roomVariant);
-      res.status(201).json(result);
-    });
-
-    app.get("/room-variants", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-      const result = await roomVariantCollection
-        .find({ hotelEmail: hotelEmail })
-        .toArray();
-      res.send(result);
-    });
-
-    app.get("/room-variants/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room variant ID" });
-      }
-      const result = await roomVariantCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      if (!result) {
-        return res.status(404).send({ message: "Room variant not found" });
-      }
-      res.send(result);
-    });
-
-    app.patch("/room-variants/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room variant ID" });
-      }
-
-      const existingVariant = await roomVariantCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      if (!existingVariant) {
-        return res.status(404).send({ message: "Room variant not found" });
-      }
-
-      const oldVariantName = existingVariant.variantName;
-
-      const updateData = {
-        variantName: req.body.variantName,
-        baseRoomType: req.body.baseRoomType,
-        price: Number(req.body.price),
-        maxOccupancy: Number(req.body.maxOccupancy),
-        bedType: req.body.bedType || "",
-        amenities: req.body.amenities || "",
-        description: req.body.description || "",
-      };
-
-      if (req.files && req.files.image) {
         const image = req.files.image;
         if (!image.mimetype.startsWith("image/")) {
           return res
@@ -663,82 +844,194 @@ async function run() {
           path.extname(image.name);
 
         await image.mv(path.join(uploadDir, uniqueName));
-        updateData.image = `/uploads/room-variants/${uniqueName}`;
-      }
 
-      const result = await roomVariantCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: updateData },
-      );
+        const roomVariant = {
+          variantName: req.body.variantName,
+          baseRoomType: req.body.baseRoomType,
+          price: Number(req.body.price),
+          maxOccupancy: Number(req.body.maxOccupancy),
+          bedType: req.body.bedType || "",
+          amenities: req.body.amenities || "",
+          description: req.body.description || "",
+          image: `/uploads/room-variants/${uniqueName}`,
+          createdAt: new Date(),
+          hotelEmail: req.body.hotelEmail || req.hotelEmail,
+        };
 
-      const roomsUpdateData = {
-        variantName: updateData.variantName,
-        baseRoomType: updateData.baseRoomType,
-        price: updateData.price,
-        maxOccupancy: updateData.maxOccupancy,
-        bedType: updateData.bedType,
-        amenities: updateData.amenities,
-        description: updateData.description,
-      };
-      if (updateData.image) {
-        roomsUpdateData.image = updateData.image;
-      }
+        const result = await roomVariantCollection.insertOne(roomVariant);
+        res.status(201).json(result);
+      },
+    );
 
-      await roomCollection.updateMany(
-        { variantName: oldVariantName },
-        { $set: roomsUpdateData },
-      );
+    app.get(
+      "/room-variants",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await roomVariantCollection
+          .find({ hotelEmail })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-      res.send(result);
-    });
+    app.get(
+      "/room-variants/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room variant ID" });
+        }
+        const result = await roomVariantCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!result) {
+          return res.status(404).send({ message: "Room variant not found" });
+        }
+        res.send(result);
+      },
+    );
 
-    app.delete("/room-variants/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid room variant ID" });
-      }
-
-      const existingVariant = await roomVariantCollection.findOne({
-        _id: new ObjectId(id),
-      });
-      if (!existingVariant) {
-        return res.status(404).send({ message: "Room variant not found" });
-      }
-
-      const variantName = existingVariant.variantName;
-
-      const result = await roomVariantCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-
-      await roomCollection.deleteMany({ variantName });
-
-      res.send(result);
-    });
-
-    app.get("/rooms/variant/:variantId", async (req, res) => {
-      try {
-        const { variantId } = req.params;
-
-        if (!variantId) {
-          return res.status(400).send({ message: "variantId is required" });
+    app.patch(
+      "/room-variants/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room variant ID" });
         }
 
-        const result = await roomCollection
-          .find({ variantId: variantId })
-          .toArray();
+        const existingVariant = await roomVariantCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!existingVariant) {
+          return res.status(404).send({ message: "Room variant not found" });
+        }
+
+        const oldVariantName = existingVariant.variantName;
+
+        const updateData = {
+          variantName: req.body.variantName,
+          baseRoomType: req.body.baseRoomType,
+          price: Number(req.body.price),
+          maxOccupancy: Number(req.body.maxOccupancy),
+          bedType: req.body.bedType || "",
+          amenities: req.body.amenities || "",
+          description: req.body.description || "",
+        };
+
+        if (req.files && req.files.image) {
+          const image = req.files.image;
+          if (!image.mimetype.startsWith("image/")) {
+            return res
+              .status(400)
+              .json({ message: "Only image files are allowed" });
+          }
+
+          const uploadDir = path.join(__dirname, "uploads", "room-variants");
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+          }
+
+          const uniqueName =
+            Date.now() +
+            "-" +
+            Math.round(Math.random() * 1e9) +
+            path.extname(image.name);
+
+          await image.mv(path.join(uploadDir, uniqueName));
+          updateData.image = `/uploads/room-variants/${uniqueName}`;
+        }
+
+        const result = await roomVariantCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData },
+        );
+
+        const roomsUpdateData = {
+          variantName: updateData.variantName,
+          baseRoomType: updateData.baseRoomType,
+          price: updateData.price,
+          maxOccupancy: updateData.maxOccupancy,
+          bedType: updateData.bedType,
+          amenities: updateData.amenities,
+          description: updateData.description,
+        };
+        if (updateData.image) {
+          roomsUpdateData.image = updateData.image;
+        }
+
+        await roomCollection.updateMany(
+          { variantName: oldVariantName },
+          { $set: roomsUpdateData },
+        );
 
         res.send(result);
-      } catch (error) {
-        console.error("Error fetching rooms by variant:", error);
-        res.status(500).send({ message: "Failed to fetch rooms" });
-      }
-    });
+      },
+    );
+
+    app.delete(
+      "/room-variants/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid room variant ID" });
+        }
+
+        const existingVariant = await roomVariantCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!existingVariant) {
+          return res.status(404).send({ message: "Room variant not found" });
+        }
+
+        const variantName = existingVariant.variantName;
+
+        const result = await roomVariantCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        await roomCollection.deleteMany({ variantName });
+
+        res.send(result);
+      },
+    );
+
+    app.get(
+      "/rooms/variant/:variantId",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const { variantId } = req.params;
+
+          if (!variantId) {
+            return res.status(400).send({ message: "variantId is required" });
+          }
+
+          const result = await roomCollection
+            .find({ variantId: variantId })
+            .toArray();
+
+          res.send(result);
+        } catch (error) {
+          console.error("Error fetching rooms by variant:", error);
+          res.status(500).send({ message: "Failed to fetch rooms" });
+        }
+      },
+    );
 
     // =========================================================
     // CHECK-IN
     // =========================================================
-    app.post("/check-in", async (req, res) => {
+    app.post("/check-in", verifyToken, verifyHotelUser, async (req, res) => {
       try {
         if (!req.files || !req.files.nidImage || !req.files.personImage) {
           return res.status(400).json({
@@ -758,7 +1051,9 @@ async function run() {
             .json({ message: "Only image files are allowed" });
         }
 
-        const hotelEmail = req.body.hotelEmail;
+        const hotelEmail = req.body.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+
         const roomNumber = String(req.body.roomNumber);
         const checkInDate = req.body.checkInDate;
         const checkOutDate = req.body.checkOutDate;
@@ -773,7 +1068,6 @@ async function run() {
           return res.status(400).json({ message: "hotelEmail is required" });
         }
 
-        // ---- Server-side discount calculation ----
         const subtotal = pricePerNight * numberOfNights;
         let discountAmount = 0;
 
@@ -787,7 +1081,6 @@ async function run() {
         const totalAmount = Math.max(subtotal - discountAmount, 0);
         const dueAmount = Math.max(totalAmount - advancePayment, 0);
 
-        // ---- Check existing Reservations (same hotel only) ----
         const reservationQuery = {
           hotelEmail,
           status: "Reserved",
@@ -796,7 +1089,6 @@ async function run() {
           departureDate: { $gte: checkInDate },
         };
 
-        // Skip conflict if this check-in is for THAT reservation
         if (reservationId && ObjectId.isValid(reservationId)) {
           reservationQuery._id = { $ne: new ObjectId(reservationId) };
         }
@@ -810,7 +1102,6 @@ async function run() {
           });
         }
 
-        // ---- Check existing active Check-Ins (same hotel only) ----
         const checkInConflict = await checkInCollection.findOne({
           hotelEmail,
           roomNumber: roomNumber,
@@ -825,7 +1116,6 @@ async function run() {
           });
         }
 
-        // ---- Upload images ----
         const uploadDir = path.join(__dirname, "uploads", "check-in");
         if (!fs.existsSync(uploadDir)) {
           fs.mkdirSync(uploadDir, { recursive: true });
@@ -845,7 +1135,6 @@ async function run() {
         await nidImage.mv(path.join(uploadDir, nidUniqueName));
         await personImage.mv(path.join(uploadDir, personUniqueName));
 
-        // ---- Build check-in document ----
         const checkInData = {
           hotelEmail,
           guestName: req.body.guestName,
@@ -864,8 +1153,6 @@ async function run() {
           checkOutDate,
           numberOfNights,
           numberOfGuests: Number(req.body.numberOfGuests) || 0,
-
-          // Payment + Discount
           subtotal,
           discountType,
           discountValue,
@@ -873,7 +1160,6 @@ async function run() {
           totalAmount,
           advancePayment,
           dueAmount,
-
           specialRequests: req.body.specialRequests || "",
           status: req.body.status || "Normal",
           restaurantOrders: [],
@@ -889,13 +1175,11 @@ async function run() {
 
         const result = await checkInCollection.insertOne(checkInData);
 
-        // ---- Mark room as Occupied (same hotel only) ----
         await roomCollection.updateOne(
           { roomNo: roomNumber, hotelEmail },
           { $set: { roomStatus: "Occupied" } },
         );
 
-        // ---- If came from a reservation → mark it Checked-In ----
         if (reservationId && ObjectId.isValid(reservationId)) {
           await reservationCollection.updateOne(
             { _id: new ObjectId(reservationId) },
@@ -916,58 +1200,61 @@ async function run() {
       }
     });
 
-    app.get("/check-in", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-      const query = {};
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-      const result = await checkInCollection.find(query).toArray();
+    app.get("/check-in", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
+      const result = await checkInCollection.find({ hotelEmail }).toArray();
       res.send(result);
     });
 
-    app.get("/check-in/all-dues", async (req, res) => {
-      const { hotelEmail } = req.query;
+    app.get(
+      "/check-in/all-dues",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
 
-      const checkIns = await checkInCollection
-        .find({ hotelEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
+        const checkIns = await checkInCollection
+          .find({ hotelEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
 
-      const duesList = checkIns.map((checkIn) => {
-        const roomDue = Number(checkIn.dueAmount) || 0;
+        const duesList = checkIns.map((checkIn) => {
+          const roomDue = Number(checkIn.dueAmount) || 0;
 
-        const restaurantDue = (checkIn.restaurantOrders || [])
-          .filter((o) => o.paymentStatus === "Due")
-          .reduce((sum, o) => sum + (Number(o.totalAmount) || 0), 0);
+          const restaurantDue = (checkIn.restaurantOrders || [])
+            .filter((o) => o.paymentStatus === "Due")
+            .reduce((sum, o) => sum + (Number(o.totalAmount) || 0), 0);
 
-        const laundryDue = (checkIn.laundryOrders || [])
-          .filter((o) => o.paymentStatus === "Due")
-          .reduce((sum, o) => sum + (Number(o.totalCost) || 0), 0);
+          const laundryDue = (checkIn.laundryOrders || [])
+            .filter((o) => o.paymentStatus === "Due")
+            .reduce((sum, o) => sum + (Number(o.totalCost) || 0), 0);
 
-        const transportDue = (checkIn.transportOrders || [])
-          .filter((o) => o.paymentStatus === "Due")
-          .reduce((sum, o) => sum + (Number(o.fare) || 0), 0);
+          const transportDue = (checkIn.transportOrders || [])
+            .filter((o) => o.paymentStatus === "Due")
+            .reduce((sum, o) => sum + (Number(o.fare) || 0), 0);
 
-        return {
-          _id: checkIn._id,
-          roomNumber: checkIn.roomNumber,
-          guestName: checkIn.guestName,
-          contactNumber: checkIn.contactNumber,
-          checkInDate: checkIn.checkInDate,
-          checkOutDate: checkIn.checkOutDate,
-          roomDue,
-          restaurantDue,
-          laundryDue,
-          transportDue,
-          totalDue: roomDue + restaurantDue + laundryDue + transportDue,
-        };
-      });
+          return {
+            _id: checkIn._id,
+            roomNumber: checkIn.roomNumber,
+            guestName: checkIn.guestName,
+            contactNumber: checkIn.contactNumber,
+            checkInDate: checkIn.checkInDate,
+            checkOutDate: checkIn.checkOutDate,
+            roomDue,
+            restaurantDue,
+            laundryDue,
+            transportDue,
+            totalDue: roomDue + restaurantDue + laundryDue + transportDue,
+          };
+        });
 
-      res.send(duesList);
-    });
+        res.send(duesList);
+      },
+    );
 
-    app.get("/check-in/:id", async (req, res) => {
+    app.get("/check-in/:id", verifyToken, verifyHotelUser, async (req, res) => {
       const { id } = req.params;
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid ID" });
@@ -976,79 +1263,102 @@ async function run() {
       res.send(result);
     });
 
-    app.patch("/check-in/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid guest ID" });
-      }
-      const result = await checkInCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: req.body },
-      );
-      res.send(result);
-    });
+    app.patch(
+      "/check-in/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid guest ID" });
+        }
+        const result = await checkInCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: req.body },
+        );
+        res.send(result);
+      },
+    );
 
-    // Banned Guests
-    app.post("/banned-guests", async (req, res) => {
-      const { checkinId } = req.body;
-      const checkIn = await checkInCollection.findOne({
-        _id: new ObjectId(checkinId),
-      });
-      if (!checkIn) {
-        return res.status(404).send({ message: "Check-in record not found" });
-      }
+    app.post(
+      "/banned-guests",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { checkinId } = req.body;
+        const checkIn = await checkInCollection.findOne({
+          _id: new ObjectId(checkinId),
+        });
+        if (!checkIn) {
+          return res.status(404).send({ message: "Check-in record not found" });
+        }
 
-      await checkInCollection.updateOne(
-        { _id: new ObjectId(checkinId) },
-        { $set: { status: "Ban" } },
-      );
+        await checkInCollection.updateOne(
+          { _id: new ObjectId(checkinId) },
+          { $set: { status: "Ban" } },
+        );
 
-      const result = await bannedGuestCollection.insertOne({
-        hotelEmail: checkIn.hotelEmail,
-        checkinId: checkIn._id,
-        designation: checkIn.designation,
-        guestName: checkIn.guestName,
-        guestAddress: checkIn.guestAddress,
-        nidNumber: checkIn.nidNumber,
-        contactNumber: checkIn.contactNumber,
-      });
+        const result = await bannedGuestCollection.insertOne({
+          hotelEmail: checkIn.hotelEmail,
+          checkinId: checkIn._id,
+          designation: checkIn.designation,
+          guestName: checkIn.guestName,
+          guestAddress: checkIn.guestAddress,
+          nidNumber: checkIn.nidNumber,
+          contactNumber: checkIn.contactNumber,
+        });
 
-      res.status(201).send({ result });
-    });
+        res.status(201).send({ result });
+      },
+    );
 
-    app.delete("/banned-guests/:checkinId", async (req, res) => {
-      const { checkinId } = req.params;
-      await bannedGuestCollection.deleteOne({
-        checkinId: new ObjectId(checkinId),
-      });
-      await checkInCollection.updateOne(
-        { _id: new ObjectId(checkinId) },
-        { $set: { status: "Normal" } },
-      );
-      res.send({ success: true });
-    });
+    app.delete(
+      "/banned-guests/:checkinId",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { checkinId } = req.params;
+        await bannedGuestCollection.deleteOne({
+          checkinId: new ObjectId(checkinId),
+        });
+        await checkInCollection.updateOne(
+          { _id: new ObjectId(checkinId) },
+          { $set: { status: "Normal" } },
+        );
+        res.send({ success: true });
+      },
+    );
 
-    app.get("/banned-guests", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
-      const query = {};
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-      const result = await bannedGuestCollection.find(query).toArray();
-      res.send(result);
-    });
+    app.get(
+      "/banned-guests",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await bannedGuestCollection
+          .find({ hotelEmail })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-    app.get("/banned-guests/check/:nidNumber", async (req, res) => {
-      const result = await bannedGuestCollection.findOne({
-        nidNumber: req.params.nidNumber,
-      });
-      res.send({ exists: !!result });
-    });
+    app.get(
+      "/banned-guests/check/:nidNumber",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const result = await bannedGuestCollection.findOne({
+          nidNumber: req.params.nidNumber,
+        });
+        res.send({ exists: !!result });
+      },
+    );
 
     // =========================================================
-    // FOOD MENU
+    // FOOD / SERVICES
     // =========================================================
-    app.post("/food-menu", async (req, res) => {
+    app.post("/food-menu", verifyToken, verifyHotelUser, async (req, res) => {
       const result = await foodMenuCollection.insertOne({
         ...req.body,
         createdAt: new Date(),
@@ -1056,53 +1366,67 @@ async function run() {
       res.status(201).send(result);
     });
 
-    app.get("/food-menu", async (req, res) => {
-      const { hotelEmail } = req.query;
+    app.get("/food-menu", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const result = await foodMenuCollection.find({ hotelEmail }).toArray();
       res.send(result);
     });
 
-    app.delete("/food-menu/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid food item ID" });
-      }
-      const result = await foodMenuCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-      res.send(result);
-    });
+    app.delete(
+      "/food-menu/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid food item ID" });
+        }
+        const result = await foodMenuCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      },
+    );
 
-    app.patch("/food-menu/:id", async (req, res) => {
-      const { id } = req.params;
-      const { _id, ...updateData } = req.body;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid food item ID" });
-      }
-      const result = await foodMenuCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: updateData },
-      );
-      res.send(result);
-    });
+    app.patch(
+      "/food-menu/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        const { _id, ...updateData } = req.body;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid food item ID" });
+        }
+        const result = await foodMenuCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData },
+        );
+        res.send(result);
+      },
+    );
 
-    // Room Services
-    app.post("/room-service", async (req, res) => {
-      const result = await roomServiceCollection.insertOne({
-        ...req.body,
-        createdAt: new Date(),
-      });
-      res.status(201).send(result);
-    });
+    app.post(
+      "/room-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const result = await roomServiceCollection.insertOne({
+          ...req.body,
+          createdAt: new Date(),
+        });
+        res.status(201).send(result);
+      },
+    );
 
-    app.get("/room-service", async (req, res) => {
-      const { active, hotelEmail } = req.query;
-      const filter = {};
+    app.get("/room-service", verifyToken, verifyHotelUser, async (req, res) => {
+      const { active } = req.query;
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
+      const filter = { hotelEmail };
       if (active) {
         filter.active_status = "active";
-      }
-      if (hotelEmail) {
-        filter.hotelEmail = hotelEmail;
       }
       const result = await roomServiceCollection
         .find(filter)
@@ -1111,109 +1435,131 @@ async function run() {
       res.send(result);
     });
 
-    // =========================================================
-    // TRANSPORT / LAUNDRY / RESTAURANT
-    // =========================================================
-    app.post("/transport-service", async (req, res) => {
-      try {
-        const result = await transportServiceCollection.insertOne({
-          ...req.body,
-          createdAt: new Date(),
-        });
+    app.post(
+      "/transport-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const result = await transportServiceCollection.insertOne({
+            ...req.body,
+            createdAt: new Date(),
+          });
 
-        if (req.body.paymentStatus === "Due" && req.body.checkinId) {
-          const transportOrder = {
-            orderId: result.insertedId,
-            pickupLocation: req.body.pickupLocation || "",
-            destination: req.body.destination || "",
-            pickupDate: req.body.pickupDate || "",
-            pickupTime: req.body.pickupTime || "",
-            vehicleType: req.body.vehicleType || "",
-            driverNumber: req.body.driverNumber || "",
-            fare: Number(req.body.fare) || 0,
-            paymentStatus: "Due",
-            orderedAt: new Date(),
-          };
+          if (req.body.paymentStatus === "Due" && req.body.checkinId) {
+            const transportOrder = {
+              orderId: result.insertedId,
+              pickupLocation: req.body.pickupLocation || "",
+              destination: req.body.destination || "",
+              pickupDate: req.body.pickupDate || "",
+              pickupTime: req.body.pickupTime || "",
+              vehicleType: req.body.vehicleType || "",
+              driverNumber: req.body.driverNumber || "",
+              fare: Number(req.body.fare) || 0,
+              paymentStatus: "Due",
+              orderedAt: new Date(),
+            };
 
-          await checkInCollection.updateOne(
-            { _id: new ObjectId(req.body.checkinId) },
-            {
-              $push: { transportOrders: transportOrder },
-              $inc: { transportTotalAmount: transportOrder.fare },
-            },
-          );
+            await checkInCollection.updateOne(
+              { _id: new ObjectId(req.body.checkinId) },
+              {
+                $push: { transportOrders: transportOrder },
+                $inc: { transportTotalAmount: transportOrder.fare },
+              },
+            );
+          }
+
+          res.status(201).send(result);
+        } catch (error) {
+          console.error(error);
+          res
+            .status(500)
+            .send({ message: "Failed to create transport service" });
         }
+      },
+    );
 
-        res.status(201).send(result);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to create transport service" });
-      }
-    });
+    app.get(
+      "/transport-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await transportServiceCollection
+          .find({ hotelEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-    app.get("/transport-service", async (req, res) => {
-      const { hotelEmail } = req.query;
-      const result = await transportServiceCollection
-        .find({ hotelEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.send(result);
-    });
+    app.post(
+      "/laundry-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const result = await laundryServiceCollection.insertOne({
+            ...req.body,
+            createdAt: new Date(),
+          });
 
-    app.post("/laundry-service", async (req, res) => {
-      try {
-        const result = await laundryServiceCollection.insertOne({
-          ...req.body,
-          createdAt: new Date(),
-        });
+          if (req.body.paymentStatus === "Due" && req.body.checkinId) {
+            const laundryOrder = {
+              orderId: result.insertedId,
+              clothItems: (req.body.clothItems || []).map((item) => ({
+                clothName: item.clothName || "",
+                quantity: Number(item.quantity) || 0,
+                price: Number(item.price) || 0,
+                totalPrice:
+                  (Number(item.quantity) || 0) * (Number(item.price) || 0),
+              })),
+              totalCost: Number(req.body.totalCost) || 0,
+              laundryType: req.body.laundryType || "",
+              pickupDate: req.body.pickupDate || "",
+              deliveryDate: req.body.deliveryDate || "",
+              assignedStaff: req.body.assignedStaff || "",
+              specialInstructions: req.body.specialInstructions || "",
+              paymentStatus: "Due",
+              orderedAt: new Date(),
+            };
 
-        if (req.body.paymentStatus === "Due" && req.body.checkinId) {
-          const laundryOrder = {
-            orderId: result.insertedId,
-            clothItems: (req.body.clothItems || []).map((item) => ({
-              clothName: item.clothName || "",
-              quantity: Number(item.quantity) || 0,
-              price: Number(item.price) || 0,
-              totalPrice:
-                (Number(item.quantity) || 0) * (Number(item.price) || 0),
-            })),
-            totalCost: Number(req.body.totalCost) || 0,
-            laundryType: req.body.laundryType || "",
-            pickupDate: req.body.pickupDate || "",
-            deliveryDate: req.body.deliveryDate || "",
-            assignedStaff: req.body.assignedStaff || "",
-            specialInstructions: req.body.specialInstructions || "",
-            paymentStatus: "Due",
-            orderedAt: new Date(),
-          };
+            await checkInCollection.updateOne(
+              { _id: new ObjectId(req.body.checkinId) },
+              {
+                $push: { laundryOrders: laundryOrder },
+                $inc: { laundryTotalAmount: laundryOrder.totalCost },
+              },
+            );
+          }
 
-          await checkInCollection.updateOne(
-            { _id: new ObjectId(req.body.checkinId) },
-            {
-              $push: { laundryOrders: laundryOrder },
-              $inc: { laundryTotalAmount: laundryOrder.totalCost },
-            },
-          );
+          res.status(201).send(result);
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({ message: "Failed to create laundry service" });
         }
+      },
+    );
 
-        res.status(201).send(result);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to create laundry service" });
-      }
-    });
+    app.get(
+      "/laundry-service",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await laundryServiceCollection
+          .find({ hotelEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-    app.get("/laundry-service", async (req, res) => {
-      const { hotelEmail } = req.query;
-      const result = await laundryServiceCollection
-        .find({ hotelEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.send(result);
-    });
-
-    // users starts from here
-
+    // =========================================================
+    // USERS (signup public, rest protected)
+    // =========================================================
     app.post("/users", async (req, res) => {
       const { hotelName, hotelEmail, email1, email2, status } = req.body;
 
@@ -1227,40 +1573,80 @@ async function run() {
       };
 
       const result = await usersCollection.insertOne(userData);
-
       res.status(201).send(result);
     });
 
-    // GET sub users by hotelEmail
-    app.get("/users", async (req, res) => {
-      const { hotelEmail } = req.query;
-      if (!hotelEmail) {
-        return res.status(400).send({ message: "hotelEmail is required" });
-      }
-
+    app.get("/users", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const result = await usersCollection.findOne({ hotelEmail });
       res.send(result || {});
     });
 
-    app.patch("/users-status-change", async (req, res) => {
-      const { email, status } = req.body;
+    app.patch(
+      "/users-status-change",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { email, status } = req.body;
 
-      if (!email || !status) {
-        return res
-          .status(400)
-          .send({ message: "Email and status are required" });
+        if (!email || !status) {
+          return res
+            .status(400)
+            .send({ message: "Email and status are required" });
+        }
+
+        const result = await usersCollection.updateOne(
+          { hotelEmail: email },
+          { $set: { status } },
+        );
+
+        res.send(result);
+      },
+    );
+
+    app.delete("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid user ID" });
+        }
+
+        const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        const emails = [user.email1, user.email2, user.hotelEmail].filter(
+          Boolean,
+        );
+
+        for (const email of emails) {
+          try {
+            const firebaseUser = await auth.getUserByEmail(email);
+            await auth.deleteUser(firebaseUser.uid);
+          } catch (firebaseError) {
+            console.log("Firebase delete skipped:", firebaseError.message);
+          }
+        }
+
+        const result = await usersCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        res.send({
+          success: true,
+          deletedCount: result.deletedCount,
+          message: "User deleted",
+        });
+      } catch (error) {
+        console.error("Delete user error:", error);
+        res.status(500).send({ message: "Failed to delete user" });
       }
-
-      const result = await usersCollection.updateOne(
-        { hotelEmail: email },
-        { $set: { status } },
-      );
-
-      res.send(result);
     });
 
-    // UPDATE sub users
-    app.patch("/users/:id", async (req, res) => {
+    app.patch("/users/:id", verifyToken, verifyHotelUser, async (req, res) => {
       const { id } = req.params;
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid ID" });
@@ -1268,7 +1654,6 @@ async function run() {
 
       const updateData = { ...req.body };
 
-      // Hash password if provided
       if (updateData.password1) {
         updateData.password1 = await bcrypt.hash(updateData.password1, 10);
       }
@@ -1276,7 +1661,6 @@ async function run() {
         updateData.password2 = await bcrypt.hash(updateData.password2, 10);
       }
 
-      // Remove undefined fields
       Object.keys(updateData).forEach(
         (key) => updateData[key] === undefined && delete updateData[key],
       );
@@ -1289,191 +1673,156 @@ async function run() {
       res.send(result);
     });
 
-    app.get("/users/:email/status", async (req, res) => {
-      try {
-        const email = req.params.email;
-
-        // 1. First check if this is a Hotel Owner
-        const hotel = await hotelCollection.findOne(
-          { email },
-          { projection: { status: 1, email: 1 } },
-        );
-
-        if (hotel) {
-          return res.send({
-            status: hotel.status,
-            type: hotel.status === "Admin" ? "admin" : "owner",
-            hotelEmail: hotel.email,
-          });
-        }
-
-        // 2. Check if this email is a Sub User (email1 or email2)
-        const subUser = await usersCollection.findOne({
-          $or: [{ email1: email }, { email2: email }],
-        });
-
-        if (subUser) {
-          return res.send({
-            status: subUser.status,
-            type: "sub-user",
-            hotelEmail: subUser.hotelEmail,
-            hotelName: subUser.hotelName,
-          });
-        }
-
-        // 3. Not found
-        return res.status(404).send({ status: "Pending" });
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to get status" });
-      }
-    });
-
-    app.post("/restaurant-orders", async (req, res) => {
-      try {
-        const result = await restaurantOrderCollection.insertOne({
-          ...req.body,
-          createdAt: new Date(),
-        });
-
-        // Accept every possible name the frontend might send
-        const rawId =
-          req.body.checkinId ||
-          req.body.checkInId ||
-          req.body.checkInInfo?._id ||
-          null;
-
-        // console.log("Received checkinId:", rawId);
-
-        if (!rawId) {
-          console.log("No checkinId → order saved but not linked to check-in");
-          return res.status(201).send(result);
-        }
-
-        let checkInObjectId;
+    app.post(
+      "/restaurant-orders",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
         try {
-          checkInObjectId = new ObjectId(rawId);
-        } catch (err) {
-          console.log("Invalid ObjectId:", rawId);
-          return res.status(201).send(result);
-        }
+          const result = await restaurantOrderCollection.insertOne({
+            ...req.body,
+            createdAt: new Date(),
+          });
 
-        const restaurantOrder = {
-          orderId: result.insertedId,
-          foodItems: (req.body.foodItems || []).map((item) => ({
-            itemName: item.itemName || "",
-            quantity: Number(item.quantity) || 0,
-            price: Number(item.price) || 0,
-            totalPrice:
-              (Number(item.quantity) || 0) * (Number(item.price) || 0),
+          const rawId =
+            req.body.checkinId ||
+            req.body.checkInId ||
+            req.body.checkInInfo?._id ||
+            null;
+
+          if (!rawId) {
+            return res.status(201).send(result);
+          }
+
+          let checkInObjectId;
+          try {
+            checkInObjectId = new ObjectId(rawId);
+          } catch (err) {
+            return res.status(201).send(result);
+          }
+
+          const restaurantOrder = {
+            orderId: result.insertedId,
+            foodItems: (req.body.foodItems || []).map((item) => ({
+              itemName: item.itemName || "",
+              quantity: Number(item.quantity) || 0,
+              price: Number(item.price) || 0,
+              totalPrice:
+                (Number(item.quantity) || 0) * (Number(item.price) || 0),
+              paymentStatus: req.body.paymentStatus || "Due",
+            })),
+            totalAmount: Number(req.body.totalAmount) || 0,
+            orderDate: req.body.orderDate || "",
+            orderTime: req.body.orderTime || "",
+            paymentMethod: req.body.paymentMethod || "",
             paymentStatus: req.body.paymentStatus || "Due",
-          })),
-          totalAmount: Number(req.body.totalAmount) || 0,
-          orderDate: req.body.orderDate || "",
-          orderTime: req.body.orderTime || "",
-          paymentMethod: req.body.paymentMethod || "",
-          paymentStatus: req.body.paymentStatus || "Due",
-          orderedAt: new Date(),
-        };
-
-        // Push for BOTH Due and Paid
-        const updateDoc = {
-          $push: { restaurantOrders: restaurantOrder },
-        };
-
-        // Only increase the due amount when status is Due
-        if (req.body.paymentStatus === "Due") {
-          updateDoc.$inc = {
-            restaurantTotalAmount: restaurantOrder.totalAmount,
+            orderedAt: new Date(),
           };
-        }
 
-        const updateResult = await checkInCollection.updateOne(
-          { _id: checkInObjectId },
-          updateDoc,
-        );
+          const updateDoc = {
+            $push: { restaurantOrders: restaurantOrder },
+          };
 
-        // console.log("matchedCount:", updateResult.matchedCount);
-        // console.log("modifiedCount:", updateResult.modifiedCount);
+          if (req.body.paymentStatus === "Due") {
+            updateDoc.$inc = {
+              restaurantTotalAmount: restaurantOrder.totalAmount,
+            };
+          }
 
-        if (updateResult.matchedCount === 0) {
-          console.log(
-            "No check-in found with _id:",
-            checkInObjectId.toString(),
+          await checkInCollection.updateOne(
+            { _id: checkInObjectId },
+            updateDoc,
           );
+
+          res.status(201).send(result);
+        } catch (error) {
+          console.error("Restaurant order error:", error);
+          res
+            .status(500)
+            .send({ message: "Failed to create restaurant order" });
+        }
+      },
+    );
+
+    app.get(
+      "/restaurant-orders",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await restaurantOrderCollection
+          .find({ hotelEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(result);
+      },
+    );
+
+    app.get(
+      "/restaurant-orders/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid order ID" });
         }
 
-        res.status(201).send(result);
-      } catch (error) {
-        console.error("Restaurant order error:", error);
-        res.status(500).send({ message: "Failed to create restaurant order" });
-      }
-    });
+        const result = await restaurantOrderCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-    app.get("/restaurant-orders", async (req, res) => {
-      const { hotelEmail } = req.query;
-      const result = await restaurantOrderCollection
-        .find({ hotelEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.send(result);
-    });
+        if (!result) {
+          return res.status(404).send({ message: "Order not found" });
+        }
 
-    app.get("/restaurant-orders/:id", async (req, res) => {
-      const { id } = req.params;
-
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid order ID" });
-      }
-
-      const result = await restaurantOrderCollection.findOne({
-        _id: new ObjectId(id),
-      });
-
-      if (!result) {
-        return res.status(404).send({ message: "Order not found" });
-      }
-
-      res.send(result);
-    });
+        res.send(result);
+      },
+    );
 
     // =========================================================
     // RESERVATIONS
     // =========================================================
-    app.post("/reservations", async (req, res) => {
-      const reservationData = {
-        ...req.body,
-        createdAt: new Date(),
-      };
+    app.post(
+      "/reservations",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const reservationData = {
+          ...req.body,
+          hotelEmail: req.body.hotelEmail || req.hotelEmail,
+          createdAt: new Date(),
+        };
 
-      // 1. Insert reservation
-      const result = await reservationCollection.insertOne(reservationData);
+        const result = await reservationCollection.insertOne(reservationData);
 
-      // 2. Only mark room as "Reserved" if the reservation covers TODAY
-      const today = new Date().toISOString().split("T")[0];
-      const coversToday =
-        req.body.arrivingDate <= today && req.body.departureDate >= today;
+        const today = new Date().toISOString().split("T")[0];
+        const coversToday =
+          req.body.arrivingDate <= today && req.body.departureDate >= today;
 
-      if (coversToday && req.body.room?.roomNo) {
-        await roomCollection.updateOne(
-          {
-            roomNo: String(req.body.room.roomNo),
-            hotelEmail: req.body.hotelEmail,
-          },
-          { $set: { roomStatus: "Reserved" } },
-        );
-      }
+        if (coversToday && req.body.room?.roomNo) {
+          await roomCollection.updateOne(
+            {
+              roomNo: String(req.body.room.roomNo),
+              hotelEmail: reservationData.hotelEmail,
+            },
+            { $set: { roomStatus: "Reserved" } },
+          );
+        }
 
-      // 3. Always recalculate the room status
-      if (req.body.room?.roomNo) {
-        await updateRoomStatus(req.body.room.roomNo);
-      }
+        if (req.body.room?.roomNo) {
+          await updateRoomStatus(req.body.room.roomNo);
+        }
 
-      res.status(201).send(result);
-    });
+        res.status(201).send(result);
+      },
+    );
 
-    app.get("/reservations", async (req, res) => {
-      const { hotelEmail } = req.query;
+    app.get("/reservations", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const result = await reservationCollection
         .find({ hotelEmail })
         .sort({ createdAt: -1 })
@@ -1481,130 +1830,175 @@ async function run() {
       res.send(result);
     });
 
-    app.patch("/reservations/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid reservation ID" });
-      }
-      const result = await reservationCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: req.body },
-      );
-      res.send(result);
-    });
-
-    app.delete("/reservations/:id", async (req, res) => {
-      const { id } = req.params;
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({ message: "Invalid reservation ID" });
-      }
-
-      const reservation = await reservationCollection.findOne({
-        _id: new ObjectId(id),
-      });
-
-      if (!reservation) {
-        return res.status(404).send({ message: "Reservation not found" });
-      }
-
-      const result = await reservationCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-
-      // Recalculate room status after deletion
-      if (reservation.room?.roomNo) {
-        await updateRoomStatus(reservation.room.roomNo);
-      }
-
-      res.send(result);
-    });
-
-    // =========================================================
-    // SALARY & PAYROLL
-    // =========================================================
-    app.post("/salary-structures", async (req, res) => {
-      try {
-        const result = await salaryStructureCollection.insertOne({
-          ...req.body,
-          createdAt: new Date(),
-        });
-        res.status(201).send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to create salary structure" });
-      }
-    });
-
-    app.get("/salary-structures", async (req, res) => {
-      try {
-        const result = await salaryStructureCollection
-          .find()
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get salary structures" });
-      }
-    });
-
-    app.get("/salary-structures/employee/:employeeId", async (req, res) => {
-      try {
-        const result = await salaryStructureCollection
-          .find({ employeeId: req.params.employeeId })
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send(result);
-      } catch (error) {
-        res
-          .status(500)
-          .send({ message: "Failed to get employee salary structures" });
-      }
-    });
-
-    app.get("/salary-structures/:id", async (req, res) => {
-      try {
-        if (!ObjectId.isValid(req.params.id)) {
-          return res.status(400).send({ message: "Invalid ID" });
+    app.patch(
+      "/reservations/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid reservation ID" });
         }
-        const result = await salaryStructureCollection.findOne({
-          _id: new ObjectId(req.params.id),
-        });
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get salary structure" });
-      }
-    });
-
-    app.patch("/salary-structures/:id", async (req, res) => {
-      try {
-        const { _id, ...updateData } = req.body;
-        if (!ObjectId.isValid(req.params.id)) {
-          return res.status(400).send({ message: "Invalid ID" });
-        }
-        const result = await salaryStructureCollection.updateOne(
-          { _id: new ObjectId(req.params.id) },
-          { $set: updateData },
+        const result = await reservationCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: req.body },
         );
         res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to update salary structure" });
-      }
-    });
+      },
+    );
 
-    app.delete("/salary-structures/:id", async (req, res) => {
-      try {
-        if (!ObjectId.isValid(req.params.id)) {
-          return res.status(400).send({ message: "Invalid ID" });
+    app.delete(
+      "/reservations/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid reservation ID" });
         }
-        const result = await salaryStructureCollection.deleteOne({
-          _id: new ObjectId(req.params.id),
-        });
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to delete salary structure" });
-      }
-    });
 
-    app.post("/payrolls", async (req, res) => {
+        const reservation = await reservationCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!reservation) {
+          return res.status(404).send({ message: "Reservation not found" });
+        }
+
+        const result = await reservationCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        if (reservation.room?.roomNo) {
+          await updateRoomStatus(reservation.room.roomNo);
+        }
+
+        res.send(result);
+      },
+    );
+
+    // =========================================================
+    // SALARY & PAYROLL — owner / admin only
+    // =========================================================
+    app.post(
+      "/salary-structures",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const result = await salaryStructureCollection.insertOne({
+            ...req.body,
+            createdAt: new Date(),
+          });
+          res.status(201).send(result);
+        } catch (error) {
+          res
+            .status(500)
+            .send({ message: "Failed to create salary structure" });
+        }
+      },
+    );
+
+    app.get(
+      "/salary-structures",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const result = await salaryStructureCollection
+            .find()
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to get salary structures" });
+        }
+      },
+    );
+
+    app.get(
+      "/salary-structures/employee/:employeeId",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const result = await salaryStructureCollection
+            .find({ employeeId: req.params.employeeId })
+            .sort({ createdAt: -1 })
+            .toArray();
+          res.send(result);
+        } catch (error) {
+          res
+            .status(500)
+            .send({ message: "Failed to get employee salary structures" });
+        }
+      },
+    );
+
+    app.get(
+      "/salary-structures/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).send({ message: "Invalid ID" });
+          }
+          const result = await salaryStructureCollection.findOne({
+            _id: new ObjectId(req.params.id),
+          });
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to get salary structure" });
+        }
+      },
+    );
+
+    app.patch(
+      "/salary-structures/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const { _id, ...updateData } = req.body;
+          if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).send({ message: "Invalid ID" });
+          }
+          const result = await salaryStructureCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updateData },
+          );
+          res.send(result);
+        } catch (error) {
+          res
+            .status(500)
+            .send({ message: "Failed to update salary structure" });
+        }
+      },
+    );
+
+    app.delete(
+      "/salary-structures/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).send({ message: "Invalid ID" });
+          }
+          const result = await salaryStructureCollection.deleteOne({
+            _id: new ObjectId(req.params.id),
+          });
+          res.send(result);
+        } catch (error) {
+          res
+            .status(500)
+            .send({ message: "Failed to delete salary structure" });
+        }
+      },
+    );
+
+    app.post("/payrolls", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
       try {
         const result = await payrollCollection.insertOne({
           ...req.body,
@@ -1616,8 +2010,9 @@ async function run() {
       }
     });
 
-    app.get("/payrolls", async (req, res) => {
-      const { hotelEmail } = req.query;
+    app.get("/payrolls", verifyToken, verifyOwnerOrAdmin, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const result = await payrollCollection
         .find({ hotelEmail })
         .sort({ createdAt: -1 })
@@ -1678,7 +2073,7 @@ async function run() {
       }
     });
 
-    app.get("/hotels", async (req, res) => {
+    app.get("/hotels", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const result = await hotelCollection
           .find({}, { projection: { password: 0 } })
@@ -1690,53 +2085,67 @@ async function run() {
       }
     });
 
-    app.get("/hotels/by-email", async (req, res) => {
-      try {
-        const { email } = req.query;
-        if (!email) {
-          return res.status(400).send({ message: "Email is required" });
+    app.get(
+      "/hotels/by-email",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const email = req.query.email || req.hotelEmail;
+          if (!email) {
+            return res.status(400).send({ message: "Email is required" });
+          }
+
+          if (req.userType !== "admin" && email !== req.hotelEmail) {
+            return res.status(403).send({ message: "Forbidden access" });
+          }
+
+          const hotel = await hotelCollection.findOne(
+            { email },
+            { projection: { password: 0 } },
+          );
+
+          if (!hotel) {
+            return res.status(404).send({ message: "Hotel not found" });
+          }
+
+          res.send(hotel);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to get hotel" });
         }
+      },
+    );
 
-        const hotel = await hotelCollection.findOne(
-          { email },
-          { projection: { password: 0 } },
-        );
+    app.patch(
+      "/hotels/:id",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: "Invalid hotel ID" });
+          }
 
-        if (!hotel) {
-          return res.status(404).send({ message: "Hotel not found" });
+          const existing = await hotelCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!existing) {
+            return res.status(404).send({ message: "Hotel not found" });
+          }
+
+          const result = await hotelCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: req.body },
+          );
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to update hotel" });
         }
+      },
+    );
 
-        res.send(hotel);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get hotel" });
-      }
-    });
-
-    app.patch("/hotels/:id", async (req, res) => {
-      try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ message: "Invalid hotel ID" });
-        }
-
-        const existing = await hotelCollection.findOne({
-          _id: new ObjectId(id),
-        });
-        if (!existing) {
-          return res.status(404).send({ message: "Hotel not found" });
-        }
-
-        const result = await hotelCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: req.body },
-        );
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to update hotel" });
-      }
-    });
-
-    app.delete("/hotels/:id", async (req, res) => {
+    app.delete("/hotels/:id", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -1776,406 +2185,462 @@ async function run() {
       }
     });
 
-    app.patch("/hotels/:id/logo", async (req, res) => {
-      try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ message: "Invalid hotel ID" });
-        }
+    app.patch(
+      "/hotels/:id/logo",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: "Invalid hotel ID" });
+          }
 
-        if (!req.files || !req.files.logo) {
-          return res.status(400).json({ message: "Logo is required" });
-        }
+          if (!req.files || !req.files.logo) {
+            return res.status(400).json({ message: "Logo is required" });
+          }
 
-        const logo = req.files.logo;
-        if (!logo.mimetype.startsWith("image/")) {
+          const logo = req.files.logo;
+          if (!logo.mimetype.startsWith("image/")) {
+            return res
+              .status(400)
+              .json({ message: "Only image files are allowed" });
+          }
+
+          const uploadDir = path.join(__dirname, "uploads", "hotels");
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+          }
+
+          const uniqueName =
+            Date.now() +
+            "-" +
+            Math.round(Math.random() * 1e9) +
+            path.extname(logo.name);
+
+          await logo.mv(path.join(uploadDir, uniqueName));
+
+          const result = await hotelCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { logo: `/uploads/hotels/${uniqueName}` } },
+          );
+
+          res.send(result);
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({ message: "Failed to update logo" });
+        }
+      },
+    );
+
+    // =========================================================
+    // REPORTS — owner / admin only
+    // =========================================================
+    app.get(
+      "/transportation-sales",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, contactNumber } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
           return res
             .status(400)
-            .json({ message: "Only image files are allowed" });
+            .send({ message: "Both fromDate and toDate are required" });
         }
-
-        const uploadDir = path.join(__dirname, "uploads", "hotels");
-        if (!fs.existsSync(uploadDir)) {
-          fs.mkdirSync(uploadDir, { recursive: true });
+        const query = {
+          hotelEmail,
+          pickupDate: { $gte: fromDate, $lte: toDate },
+        };
+        if (contactNumber) {
+          query.contactNumber = contactNumber;
         }
-
-        const uniqueName =
-          Date.now() +
-          "-" +
-          Math.round(Math.random() * 1e9) +
-          path.extname(logo.name);
-
-        await logo.mv(path.join(uploadDir, uniqueName));
-
-        const result = await hotelCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { logo: `/uploads/hotels/${uniqueName}` } },
-        );
+        const result = await transportServiceCollection
+          .find(query)
+          .sort({ pickupDate: 1, pickupTime: 1 })
+          .toArray();
 
         res.send(result);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to update logo" });
-      }
-    });
+      },
+    );
 
-    // =========================================================
-    // REPORTS
-    // =========================================================
-    app.get("/transportation-sales", async (req, res) => {
-      const { fromDate, toDate, contactNumber, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      const query = {
-        hotelEmail,
-        pickupDate: { $gte: fromDate, $lte: toDate },
-      };
-      if (contactNumber) {
-        query.contactNumber = contactNumber;
-      }
-      const result = await transportServiceCollection
-        .find(query)
-        .sort({ pickupDate: 1, pickupTime: 1 })
-        .toArray();
+    app.get(
+      "/room-sales",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, roomNumber } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
+          return res
+            .status(400)
+            .send({ message: "Both fromDate and toDate are required" });
+        }
+        const query = {
+          hotelEmail,
+          checkedOutAt: {
+            $gte: new Date(fromDate),
+            $lte: new Date(toDate + "T23:59:59.999Z"),
+          },
+        };
+        if (roomNumber) {
+          query.roomNumber = roomNumber;
+        }
+        const result = await checkOutCollection
+          .find(query)
+          .sort({ checkedOutAt: 1 })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-      res.send(result);
-    });
+    app.get(
+      "/restaurant-sales",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, contactNumber } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
+          return res
+            .status(400)
+            .send({ message: "Both fromDate and toDate are required" });
+        }
+        const query = {
+          hotelEmail,
+          orderDate: { $gte: fromDate, $lte: toDate },
+        };
+        if (contactNumber) {
+          query["checkInInfo.contactNumber"] = contactNumber;
+        }
+        const result = await restaurantOrderCollection
+          .find(query)
+          .sort({ orderDate: 1, orderTime: 1 })
+          .toArray();
 
-    app.get("/room-sales", async (req, res) => {
-      const { fromDate, toDate, roomNumber, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      const query = {
-        checkedOutAt: {
-          $gte: new Date(fromDate),
-          $lte: new Date(toDate + "T23:59:59.999Z"),
-        },
-      };
-      if (roomNumber) {
-        query.roomNumber = roomNumber;
-      }
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-      const result = await checkOutCollection
-        .find(query)
-        .sort({ checkedOutAt: 1 })
-        .toArray();
-      res.send(result);
-    });
+        res.send(result);
+      },
+    );
 
-    app.get("/restaurant-sales", async (req, res) => {
-      const { fromDate, toDate, contactNumber, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      const query = {
-        hotelEmail,
-        orderDate: { $gte: fromDate, $lte: toDate },
-      };
-      if (contactNumber) {
-        query["checkInInfo.contactNumber"] = contactNumber;
-      }
-      const result = await restaurantOrderCollection
-        .find(query)
-        .sort({ orderDate: 1, orderTime: 1 })
-        .toArray();
+    app.get(
+      "/laundry-sales",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, contactNumber } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
+          return res
+            .status(400)
+            .send({ message: "Both fromDate and toDate are required" });
+        }
+        const query = {
+          hotelEmail,
+          pickupDate: { $gte: fromDate, $lte: toDate },
+        };
+        if (contactNumber) {
+          query.contactNumber = contactNumber;
+        }
+        const result = await laundryServiceCollection
+          .find(query)
+          .sort({ pickupDate: 1 })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-      res.send(result);
-    });
-
-    app.get("/laundry-sales", async (req, res) => {
-      const { fromDate, toDate, contactNumber, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      const query = {
-        pickupDate: { $gte: fromDate, $lte: toDate },
-      };
-      if (contactNumber) {
-        query.contactNumber = contactNumber;
-      }
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-      const result = await laundryServiceCollection
-        .find(query)
-        .sort({ pickupDate: 1 })
-        .toArray();
-
-      res.send(result);
-    });
-
-    app.get("/salary-report", async (req, res) => {
-      const { fromDate, toDate, employeeId, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      const query = {
-        paidAt: {
-          $gte: fromDate,
-          $lte: toDate + "T23:59:59.999Z",
-        },
-      };
-      if (employeeId) {
-        query.employeeID = employeeId;
-      }
-      if (hotelEmail) {
-        query.hotelEmail = hotelEmail;
-      }
-      const payrolls = await payrollCollection
-        .find(query)
-        .sort({ paidAt: -1 })
-        .toArray();
-      const result = await Promise.all(
-        payrolls.map(async (payroll) => {
-          let employee = null;
-          if (payroll.employeeId) {
-            employee = await employeeCollection.findOne({
-              _id: new ObjectId(payroll.employeeId),
-            });
-          }
-          return {
-            ...payroll,
-            employeeDetails: employee || null,
-          };
-        }),
-      );
-      res.send(result);
-    });
+    app.get(
+      "/salary-report",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, employeeId } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
+          return res
+            .status(400)
+            .send({ message: "Both fromDate and toDate are required" });
+        }
+        const query = {
+          hotelEmail,
+          paidAt: {
+            $gte: fromDate,
+            $lte: toDate + "T23:59:59.999Z",
+          },
+        };
+        if (employeeId) {
+          query.employeeID = employeeId;
+        }
+        const payrolls = await payrollCollection
+          .find(query)
+          .sort({ paidAt: -1 })
+          .toArray();
+        const result = await Promise.all(
+          payrolls.map(async (payroll) => {
+            let employee = null;
+            if (payroll.employeeId) {
+              employee = await employeeCollection.findOne({
+                _id: new ObjectId(payroll.employeeId),
+              });
+            }
+            return {
+              ...payroll,
+              employeeDetails: employee || null,
+            };
+          }),
+        );
+        res.send(result);
+      },
+    );
 
     // =========================================================
     // EXPENSE
     // =========================================================
-    app.post("/expense-categories", async (req, res) => {
-      const { categoryName, hotelEmail } = req.body;
-      if (!categoryName || categoryName.trim() === "") {
-        return res.status(400).send({ message: "Category name is required" });
-      }
-      if (!hotelEmail || hotelEmail.trim() === "") {
-        return res.status(400).send({ message: "Hotel email is required" });
-      }
-      const exists = await expenseCategoryCollection.findOne({
-        categoryName: categoryName.trim(),
-        hotelEmail: hotelEmail.trim(),
-      });
-      if (exists) {
-        return res.status(400).send({ message: "Category already exists" });
-      }
-      const result = await expenseCategoryCollection.insertOne({
-        categoryName: categoryName.trim(),
-        hotelEmail: hotelEmail.trim(),
-        createdAt: new Date(),
-      });
-      res.status(201).send(result);
-    });
-
-    app.get("/expense-categories", async (req, res) => {
-      const { hotelEmail } = req.query;
-      if (!hotelEmail) {
-        return res.status(400).send({ message: "Hotel email is required" });
-      }
-      const result = await expenseCategoryCollection
-        .find({ hotelEmail })
-        .sort({ createdAt: -1 })
-        .toArray();
-      res.send(result);
-    });
-
-    app.post("/expense-entries", async (req, res) => {
-      const expense = { ...req.body, createdAt: new Date() };
-      const result = await expenseEntryCollection.insertOne(expense);
-      res.send(result);
-    });
-
-    app.get("/expense-overview", async (req, res) => {
-      const { fromDate, toDate, categoryName, hotelEmail } = req.query;
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-      if (!hotelEmail) {
-        return res.status(400).send({ message: "Hotel email is required" });
-      }
-      const query = {
-        expenseDate: { $gte: fromDate, $lte: toDate },
-        hotelEmail,
-      };
-      if (categoryName) {
-        query.categoryName = categoryName;
-      }
-      const result = await expenseEntryCollection
-        .find(query)
-        .sort({ expenseDate: 1 })
-        .toArray();
-      res.send(result);
-    });
-
-    // =========================================================
-    // CHECKOUT (Improved - Clean per-stay data)
-    // =========================================================
-    app.post("/check-out/:id", async (req, res) => {
-      try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ message: "Invalid check-in ID" });
+    app.post(
+      "/expense-categories",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { categoryName } = req.body;
+        const hotelEmail = req.body.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!categoryName || categoryName.trim() === "") {
+          return res.status(400).send({ message: "Category name is required" });
         }
-
-        const checkIn = await checkInCollection.findOne({
-          _id: new ObjectId(id),
+        if (!hotelEmail || hotelEmail.trim() === "") {
+          return res.status(400).send({ message: "Hotel email is required" });
+        }
+        const exists = await expenseCategoryCollection.findOne({
+          categoryName: categoryName.trim(),
+          hotelEmail: hotelEmail.trim(),
         });
-        if (!checkIn) {
-          return res.status(404).send({ message: "Check-in record not found" });
+        if (exists) {
+          return res.status(400).send({ message: "Category already exists" });
         }
-        if (checkIn.status === "Checked Out") {
-          return res.status(400).send({ message: "Guest already checked out" });
+        const result = await expenseCategoryCollection.insertOne({
+          categoryName: categoryName.trim(),
+          hotelEmail: hotelEmail.trim(),
+          createdAt: new Date(),
+        });
+        res.status(201).send(result);
+      },
+    );
+
+    app.get(
+      "/expense-categories",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        const result = await expenseCategoryCollection
+          .find({ hotelEmail })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(result);
+      },
+    );
+
+    app.post(
+      "/expense-entries",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const expense = {
+          ...req.body,
+          hotelEmail: req.body.hotelEmail || req.hotelEmail,
+          createdAt: new Date(),
+        };
+        const result = await expenseEntryCollection.insertOne(expense);
+        res.send(result);
+      },
+    );
+
+    app.get(
+      "/expense-overview",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        const { fromDate, toDate, categoryName } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+        if (!fromDate || !toDate) {
+          return res
+            .status(400)
+            .send({ message: "Both fromDate and toDate are required" });
         }
+        const query = {
+          expenseDate: { $gte: fromDate, $lte: toDate },
+          hotelEmail,
+        };
+        if (categoryName) {
+          query.categoryName = categoryName;
+        }
+        const result = await expenseEntryCollection
+          .find(query)
+          .sort({ expenseDate: 1 })
+          .toArray();
+        res.send(result);
+      },
+    );
 
-        const {
-          actualCheckoutDate,
-          actualNights,
-          actualRoomCharge,
-          restaurantDue,
-          laundryDue,
-          transportDue,
-          totalCharges,
-          advancePayment,
-          finalAmount,
-          isRefund,
-        } = req.body;
+    // =========================================================
+    // CHECKOUT
+    // =========================================================
+    app.post(
+      "/check-out/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: "Invalid check-in ID" });
+          }
 
-        // Clean checkout document - only this stay's data
-        const checkoutData = {
-          hotelEmail: checkIn.hotelEmail,
-          guestName: checkIn.guestName,
-          guestAddress: checkIn.guestAddress,
-          contactNumber: checkIn.contactNumber,
-          designation: checkIn.designation,
-          nidNumber: checkIn.nidNumber || "",
-          personImage: checkIn.personImage,
-          nidImage: checkIn.nidImage,
+          const checkIn = await checkInCollection.findOne({
+            _id: new ObjectId(id),
+          });
+          if (!checkIn) {
+            return res
+              .status(404)
+              .send({ message: "Check-in record not found" });
+          }
+          if (checkIn.status === "Checked Out") {
+            return res
+              .status(400)
+              .send({ message: "Guest already checked out" });
+          }
 
-          roomNumber: checkIn.roomNumber,
-          roomVariantId: checkIn.roomVariantId,
-          roomVariantName: checkIn.roomVariantName,
-          pricePerNight: checkIn.pricePerNight,
-          roomChangeHistory: checkIn.roomChangeHistory || [],
+          const {
+            actualCheckoutDate,
+            actualNights,
+            actualRoomCharge,
+            restaurantDue,
+            laundryDue,
+            transportDue,
+            totalCharges,
+            advancePayment,
+            finalAmount,
+            isRefund,
+          } = req.body;
 
-          checkInDate: checkIn.checkInDate,
-          checkInTime: checkIn.checkInTime,
-          checkOutDate: checkIn.checkOutDate,
-          actualCheckoutDate:
-            actualCheckoutDate || new Date().toISOString().split("T")[0],
-          actualNights: Number(actualNights) || checkIn.numberOfNights,
-          numberOfGuests: checkIn.numberOfGuests,
-          numberOfNights: checkIn.numberOfNights,
-
-          actualRoomCharge: Number(actualRoomCharge) || checkIn.totalAmount,
-          restaurantDue: Number(restaurantDue) || 0,
-          laundryDue: Number(laundryDue) || 0,
-          transportDue: Number(transportDue) || 0,
-          totalCharges: Number(totalCharges) || 0,
-          advancePayment: Number(advancePayment) || checkIn.advancePayment,
-          finalAmount: Number(finalAmount) || 0,
-          isRefund: Boolean(isRefund),
-
-          restaurantOrders: (checkIn.restaurantOrders || []).map((order) => ({
-            ...order,
-            paymentStatus: "Paid",
-            foodItems: (order.foodItems || []).map((item) => ({
-              ...item,
+          const checkoutData = {
+            hotelEmail: checkIn.hotelEmail,
+            guestName: checkIn.guestName,
+            guestAddress: checkIn.guestAddress,
+            contactNumber: checkIn.contactNumber,
+            designation: checkIn.designation,
+            nidNumber: checkIn.nidNumber || "",
+            personImage: checkIn.personImage,
+            nidImage: checkIn.nidImage,
+            roomNumber: checkIn.roomNumber,
+            roomVariantId: checkIn.roomVariantId,
+            roomVariantName: checkIn.roomVariantName,
+            pricePerNight: checkIn.pricePerNight,
+            roomChangeHistory: checkIn.roomChangeHistory || [],
+            checkInDate: checkIn.checkInDate,
+            checkInTime: checkIn.checkInTime,
+            checkOutDate: checkIn.checkOutDate,
+            actualCheckoutDate:
+              actualCheckoutDate || new Date().toISOString().split("T")[0],
+            actualNights: Number(actualNights) || checkIn.numberOfNights,
+            numberOfGuests: checkIn.numberOfGuests,
+            numberOfNights: checkIn.numberOfNights,
+            actualRoomCharge: Number(actualRoomCharge) || checkIn.totalAmount,
+            restaurantDue: Number(restaurantDue) || 0,
+            laundryDue: Number(laundryDue) || 0,
+            transportDue: Number(transportDue) || 0,
+            totalCharges: Number(totalCharges) || 0,
+            advancePayment: Number(advancePayment) || checkIn.advancePayment,
+            finalAmount: Number(finalAmount) || 0,
+            isRefund: Boolean(isRefund),
+            restaurantOrders: (checkIn.restaurantOrders || []).map((order) => ({
+              ...order,
+              paymentStatus: "Paid",
+              foodItems: (order.foodItems || []).map((item) => ({
+                ...item,
+                paymentStatus: "Paid",
+              })),
+            })),
+            laundryOrders: (checkIn.laundryOrders || []).map((order) => ({
+              ...order,
               paymentStatus: "Paid",
             })),
-          })),
-          laundryOrders: (checkIn.laundryOrders || []).map((order) => ({
-            ...order,
-            paymentStatus: "Paid",
-          })),
-          transportOrders: (checkIn.transportOrders || []).map((order) => ({
-            ...order,
-            paymentStatus: "Paid",
-          })),
+            transportOrders: (checkIn.transportOrders || []).map((order) => ({
+              ...order,
+              paymentStatus: "Paid",
+            })),
+            originalCheckInId: checkIn._id,
+            status: "Checked Out",
+            checkedOutAt: new Date(),
+            createdAt: checkIn.createdAt,
+          };
 
-          originalCheckInId: checkIn._id,
-          status: "Checked Out",
-          checkedOutAt: new Date(),
-          createdAt: checkIn.createdAt,
-        };
+          const insertResult = await checkOutCollection.insertOne(checkoutData);
 
-        const insertResult = await checkOutCollection.insertOne(checkoutData);
-
-        // Mark related orders as Paid
-        if (checkIn.restaurantOrders?.length > 0) {
-          const ids = checkIn.restaurantOrders
-            .map((o) => o.orderId)
-            .filter(Boolean);
-          if (ids.length) {
-            await restaurantOrderCollection.updateMany(
-              { _id: { $in: ids.map((id) => new ObjectId(id)) } },
-              { $set: { paymentStatus: "Paid" } },
-            );
+          if (checkIn.restaurantOrders?.length > 0) {
+            const ids = checkIn.restaurantOrders
+              .map((o) => o.orderId)
+              .filter(Boolean);
+            if (ids.length) {
+              await restaurantOrderCollection.updateMany(
+                { _id: { $in: ids.map((oid) => new ObjectId(oid)) } },
+                { $set: { paymentStatus: "Paid" } },
+              );
+            }
           }
-        }
 
-        if (checkIn.laundryOrders?.length > 0) {
-          const ids = checkIn.laundryOrders
-            .map((o) => o.orderId)
-            .filter(Boolean);
-          if (ids.length) {
-            await laundryServiceCollection.updateMany(
-              { _id: { $in: ids.map((id) => new ObjectId(id)) } },
-              { $set: { paymentStatus: "Paid" } },
-            );
+          if (checkIn.laundryOrders?.length > 0) {
+            const ids = checkIn.laundryOrders
+              .map((o) => o.orderId)
+              .filter(Boolean);
+            if (ids.length) {
+              await laundryServiceCollection.updateMany(
+                { _id: { $in: ids.map((oid) => new ObjectId(oid)) } },
+                { $set: { paymentStatus: "Paid" } },
+              );
+            }
           }
-        }
 
-        if (checkIn.transportOrders?.length > 0) {
-          const ids = checkIn.transportOrders
-            .map((o) => o.orderId)
-            .filter(Boolean);
-          if (ids.length) {
-            await transportServiceCollection.updateMany(
-              { _id: { $in: ids.map((id) => new ObjectId(id)) } },
-              { $set: { paymentStatus: "Paid" } },
-            );
+          if (checkIn.transportOrders?.length > 0) {
+            const ids = checkIn.transportOrders
+              .map((o) => o.orderId)
+              .filter(Boolean);
+            if (ids.length) {
+              await transportServiceCollection.updateMany(
+                { _id: { $in: ids.map((oid) => new ObjectId(oid)) } },
+                { $set: { paymentStatus: "Paid" } },
+              );
+            }
           }
+
+          await checkInCollection.deleteOne({ _id: new ObjectId(id) });
+          await updateRoomStatus(checkIn.roomNumber);
+
+          res.send({
+            success: true,
+            message: "Checkout completed successfully",
+            checkoutId: insertResult.insertedId,
+          });
+        } catch (error) {
+          console.error("Checkout error:", error);
+          res.status(500).send({
+            message: "Failed to complete checkout",
+            error: error.message,
+          });
         }
+      },
+    );
 
-        // Delete the check-in record
-        await checkInCollection.deleteOne({ _id: new ObjectId(id) });
-
-        // Update room status
-        await updateRoomStatus(checkIn.roomNumber);
-
-        res.send({
-          success: true,
-          message: "Checkout completed successfully",
-          checkoutId: insertResult.insertedId,
-        });
-      } catch (error) {
-        console.error("Checkout error:", error);
-        res.status(500).send({
-          message: "Failed to complete checkout",
-          error: error.message,
-        });
-      }
-    });
-
-    app.get("/check-out", async (req, res) => {
-      const hotelEmail = req.query.hotelEmail;
+    app.get("/check-out", verifyToken, verifyHotelUser, async (req, res) => {
+      const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+      if (!assertSameHotel(req, res, hotelEmail)) return;
       const result = await checkOutCollection
         .find({ hotelEmail })
         .sort({ checkedOutAt: -1 })
@@ -2183,25 +2648,161 @@ async function run() {
       res.send(result);
     });
 
-    // NEW: Get all checkouts of a specific guest
-    app.get("/check-out/guest", async (req, res) => {
-      try {
-        const { hotelEmail, contactNumber, nidNumber } = req.query;
+    app.get(
+      "/check-out/guest",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const { contactNumber, nidNumber } = req.query;
+          const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+          if (!assertSameHotel(req, res, hotelEmail)) return;
 
-        if (!hotelEmail) {
-          return res.status(400).send({ message: "hotelEmail is required" });
+          if (!hotelEmail) {
+            return res.status(400).send({ message: "hotelEmail is required" });
+          }
+
+          const query = { hotelEmail };
+
+          if (nidNumber && nidNumber.trim() !== "") {
+            query.nidNumber = nidNumber;
+          } else if (contactNumber) {
+            query.contactNumber = contactNumber;
+          } else {
+            return res
+              .status(400)
+              .send({ message: "contactNumber or nidNumber is required" });
+          }
+
+          const result = await checkOutCollection
+            .find(query)
+            .sort({ checkedOutAt: -1 })
+            .toArray();
+
+          res.send(result);
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({ message: "Failed to get guest checkouts" });
         }
+      },
+    );
 
-        const query = { hotelEmail };
+    app.get(
+      "/check-out/:id",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          if (!ObjectId.isValid(req.params.id)) {
+            return res.status(400).send({ message: "Invalid ID" });
+          }
+          const result = await checkOutCollection.findOne({
+            _id: new ObjectId(req.params.id),
+          });
+          if (!result) {
+            return res
+              .status(404)
+              .send({ message: "Checkout record not found" });
+          }
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Failed to get checkout details" });
+        }
+      },
+    );
 
-        if (nidNumber && nidNumber.trim() !== "") {
-          query.nidNumber = nidNumber;
-        } else if (contactNumber) {
-          query.contactNumber = contactNumber;
-        } else {
+    app.get(
+      "/unique-guests",
+      verifyToken,
+      verifyHotelUser,
+      async (req, res) => {
+        try {
+          const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+          if (!assertSameHotel(req, res, hotelEmail)) return;
+
+          if (!hotelEmail) {
+            return res.status(400).send({ message: "hotelEmail is required" });
+          }
+
+          const uniqueGuests = await checkOutCollection
+            .aggregate([
+              { $match: { hotelEmail: hotelEmail } },
+              { $sort: { checkedOutAt: -1 } },
+              {
+                $group: {
+                  _id: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $ne: ["$nidNumber", ""] },
+                          { $ne: ["$nidNumber", null] },
+                        ],
+                      },
+                      "$nidNumber",
+                      { $concat: ["$contactNumber", "_", "$guestName"] },
+                    ],
+                  },
+                  guestName: { $first: "$guestName" },
+                  contactNumber: { $first: "$contactNumber" },
+                  nidNumber: { $first: "$nidNumber" },
+                  guestAddress: { $first: "$guestAddress" },
+                  designation: { $first: "$designation" },
+                  personImage: { $first: "$personImage" },
+                  totalStays: { $sum: 1 },
+                  lastCheckoutDate: { $first: "$checkedOutAt" },
+                  lastRoomNumber: { $first: "$roomNumber" },
+                  lastRoomVariant: { $first: "$roomVariantName" },
+                  totalSpent: {
+                    $sum: {
+                      $ifNull: [
+                        "$totalCharges",
+                        { $ifNull: ["$actualRoomCharge", "$totalAmount"] },
+                      ],
+                    },
+                  },
+                },
+              },
+              { $sort: { lastCheckoutDate: -1 } },
+            ])
+            .toArray();
+
+          res.send(uniqueGuests);
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({ message: "Failed to get unique guests" });
+        }
+      },
+    );
+
+    app.get(
+      "/refunded-checkouts",
+      verifyToken,
+      verifyOwnerOrAdmin,
+      async (req, res) => {
+        const { fromDate, toDate, contactNumber } = req.query;
+        const hotelEmail = req.query.hotelEmail || req.hotelEmail;
+        if (!assertSameHotel(req, res, hotelEmail)) return;
+
+        if (!fromDate || !toDate) {
           return res
             .status(400)
-            .send({ message: "contactNumber or nidNumber is required" });
+            .send({ message: "Both fromDate and toDate are required" });
+        }
+
+        const query = {
+          hotelEmail,
+          isRefund: true,
+          checkedOutAt: {
+            $gte: new Date(fromDate),
+            $lte: new Date(toDate + "T23:59:59.999Z"),
+          },
+        };
+
+        if (contactNumber) {
+          query.contactNumber = {
+            $regex: contactNumber,
+            $options: "i",
+          };
         }
 
         const result = await checkOutCollection
@@ -2210,144 +2811,8 @@ async function run() {
           .toArray();
 
         res.send(result);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to get guest checkouts" });
-      }
-    });
-
-    app.get("/check-out/:id", async (req, res) => {
-      try {
-        if (!ObjectId.isValid(req.params.id)) {
-          return res.status(400).send({ message: "Invalid ID" });
-        }
-        const result = await checkOutCollection.findOne({
-          _id: new ObjectId(req.params.id),
-        });
-        if (!result) {
-          return res.status(404).send({ message: "Checkout record not found" });
-        }
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to get checkout details" });
-      }
-    });
-
-    // =========================================================
-    // UNIQUE GUESTS
-    // =========================================================
-    app.get("/unique-guests", async (req, res) => {
-      try {
-        const hotelEmail = req.query.hotelEmail;
-
-        if (!hotelEmail) {
-          return res.status(400).send({ message: "hotelEmail is required" });
-        }
-
-        const uniqueGuests = await checkOutCollection
-          .aggregate([
-            { $match: { hotelEmail: hotelEmail } },
-            { $sort: { checkedOutAt: -1 } },
-            {
-              $group: {
-                _id: {
-                  $cond: [
-                    {
-                      $and: [
-                        { $ne: ["$nidNumber", ""] },
-                        { $ne: ["$nidNumber", null] },
-                      ],
-                    },
-                    "$nidNumber",
-                    { $concat: ["$contactNumber", "_", "$guestName"] },
-                  ],
-                },
-                guestName: { $first: "$guestName" },
-                contactNumber: { $first: "$contactNumber" },
-                nidNumber: { $first: "$nidNumber" },
-                guestAddress: { $first: "$guestAddress" },
-                designation: { $first: "$designation" },
-                personImage: { $first: "$personImage" },
-                totalStays: { $sum: 1 },
-                lastCheckoutDate: { $first: "$checkedOutAt" },
-                lastRoomNumber: { $first: "$roomNumber" },
-                lastRoomVariant: { $first: "$roomVariantName" },
-                totalSpent: {
-                  $sum: {
-                    $ifNull: [
-                      "$totalCharges",
-                      { $ifNull: ["$actualRoomCharge", "$totalAmount"] },
-                    ],
-                  },
-                },
-              },
-            },
-            { $sort: { lastCheckoutDate: -1 } },
-          ])
-          .toArray();
-
-        res.send(uniqueGuests);
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to get unique guests" });
-      }
-    });
-
-    app.get("/refunded-checkouts", async (req, res) => {
-      const { fromDate, toDate, contactNumber, hotelEmail } = req.query;
-
-      if (!fromDate || !toDate) {
-        return res
-          .status(400)
-          .send({ message: "Both fromDate and toDate are required" });
-      }
-
-      const query = {
-        hotelEmail,
-        isRefund: true,
-        checkedOutAt: {
-          $gte: new Date(fromDate),
-          $lte: new Date(toDate + "T23:59:59.999Z"),
-        },
-      };
-
-      if (contactNumber) {
-        query.contactNumber = {
-          $regex: contactNumber,
-          $options: "i",
-        };
-      }
-
-      const result = await checkOutCollection
-        .find(query)
-        .sort({ checkedOutAt: -1 })
-        .toArray();
-
-      res.send(result);
-    });
-
-    // =========================================================
-    // USER STATUS (for PrivateRoute)
-    // =========================================================
-    app.get("/users/:email/status", async (req, res) => {
-      try {
-        const email = req.params.email;
-
-        const hotel = await hotelCollection.findOne(
-          { email: email },
-          { projection: { status: 1 } },
-        );
-
-        if (!hotel) {
-          return res.status(404).send({ status: "Pending" });
-        }
-
-        res.send({ status: hotel.status });
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Failed to get status" });
-      }
-    });
+      },
+    );
 
     // =========================================================
     // SMART ROOM STATUS UPDATER
@@ -2425,10 +2890,7 @@ async function run() {
     updateAllRoomStatuses();
     setInterval(updateAllRoomStatuses, 24 * 60 * 60 * 1000);
 
-    // =========================================================
-    // CHANGE ROOM (Room Transfer) - Only one definition
-    // =========================================================
-    app.post("/change-room", async (req, res) => {
+    app.post("/change-room", verifyToken, verifyHotelUser, async (req, res) => {
       try {
         const {
           checkInId,
@@ -2552,13 +3014,9 @@ async function run() {
       }
     });
 
-    // =========================================================
-    // START SERVER
-    // =========================================================
-    // await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!",
-    );
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!",
+    // );
 
     app.listen(port, () => {
       console.log(`Server is running on port ${port}`);
