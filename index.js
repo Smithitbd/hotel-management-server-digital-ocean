@@ -195,7 +195,7 @@ async function run() {
         res.status(200).send({
           message: "If this email exists, a password reset link has been sent.",
         });
-      } catch (error) catch (error) {
+      } catch (error) {
   
   console.error("Firebase Auth Error Detail:", JSON.stringify(error, null, 2));
   return res.status(500).json({ success: false, error: error.message });
