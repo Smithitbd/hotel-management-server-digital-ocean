@@ -39,7 +39,7 @@ const auth = getAuth();
 
 const transporter = nodemailer.createTransport({
   host: "smtp.zoho.com",
-  port: 465,
+  port: 587,
   secure: true,
   auth: {
     user: "security@smithit.com.bd", // full email
