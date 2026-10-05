@@ -195,15 +195,11 @@ async function run() {
         res.status(200).send({
           message: "If this email exists, a password reset link has been sent.",
         });
-      } catch (error) {
-    
-    console.error("Forgot Password Internal Error:", error);
-
-    return res.status(500).json({ 
-      success: false, 
-      error: error.message || "Internal Server Error" 
-    });
-  }
+      } catch (error) catch (error) {
+  
+  console.error("Firebase Auth Error Detail:", JSON.stringify(error, null, 2));
+  return res.status(500).json({ success: false, error: error.message });
+}
     });
 
     const verifyToken = (req, res, next) => {
