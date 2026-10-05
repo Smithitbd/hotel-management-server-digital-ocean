@@ -196,11 +196,14 @@ async function run() {
           message: "If this email exists, a password reset link has been sent.",
         });
       } catch (error) {
-        console.error("Forgot password error:", error);
-        res
-          .status(500)
-          .send({ message: "Failed to process password reset request" });
-      }
+    
+    console.error("Forgot Password Internal Error:", error);
+
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || "Internal Server Error" 
+    });
+  }
     });
 
     const verifyToken = (req, res, next) => {
