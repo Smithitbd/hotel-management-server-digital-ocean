@@ -158,7 +158,7 @@ async function run() {
         }
 
         // Custom frontend link
-        const frontendResetLink = `https://smithit.obokash.site//reset-password?oobCode=${oobCode}`;
+        const frontendResetLink = `https://smithit.obokash.site/reset-password?oobCode=${oobCode}`;
 
         console.log("Frontend Link:", frontendResetLink);
 
