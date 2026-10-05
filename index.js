@@ -53,7 +53,9 @@ const transporter = nodemailer.createTransport({
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin:["https://smithit.obokash.site","http://localhost:5173"],credentials:true,
+}));
 app.use(express.json());
 app.use(fileUpload());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
