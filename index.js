@@ -115,92 +115,61 @@ async function run() {
     // =========================================================
     // FORGOT PASSWORD (custom email with frontend reset link)
     // =========================================================
-    app.post("/forgot-password", async (req, res) => {
-      try {
-        const { email } = req.body;
+  app.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).send({ message: "Email is required" });
+    }
 
-        if (!email) {
-          return res.status(400).send({ message: "Email is required" });
-        }
+    // Always return the same message (security)
+    const genericMsg = {
+      message: "If this email exists, a password reset link has been sent.",
+    };
 
-        // Check if user exists in Firebase
-        try {
-          await auth.getUserByEmail(email);
-        } catch (error) {
-          // Don't reveal whether the email exists
-          return res.status(200).send({
-            message:
-              "If this email exists, a password reset link has been sent.",
-          });
-        }
+    // Check user exists (optional – you can even skip this for speed)
+    try {
+      await auth.getUserByEmail(email);
+    } catch {
+      return res.status(200).send(genericMsg);
+    }
 
-        // Generate Firebase password reset link
-        const actionCodeSettings = {
-          url: "https://smithit.obokash.site/reset-password",
-          handleCodeInApp: true,
-        };
+    // Generate link
+    const actionCodeSettings = {
+      url: "https://smithit.obokash.site/reset-password",
+      handleCodeInApp: true,
+    };
+    const resetLink = await auth.generatePasswordResetLink(email, actionCodeSettings);
+    const oobCode = new URL(resetLink).searchParams.get("oobCode");
+    if (!oobCode) {
+      return res.status(500).send({ message: "Failed to generate reset code" });
+    }
 
-        const resetLink = await auth.generatePasswordResetLink(
-          email,
-          actionCodeSettings,
-        );
+    const frontendResetLink = `https://smithit.obokash.site/reset-password?oobCode=${oobCode}`;
 
-        console.log("Full Firebase Reset Link:", resetLink);
+    // Respond immediately
+    res.status(200).send(genericMsg);
 
-        // Extract oobCode from the Firebase link
-        const url = new URL(resetLink);
-        const oobCode = url.searchParams.get("oobCode");
-
-        console.log("Extracted oobCode:", oobCode);
-
-        if (!oobCode) {
-          return res
-            .status(500)
-            .send({ message: "Failed to generate reset code" });
-        }
-
-        // Custom frontend link
-        const frontendResetLink = `https://smithit.obokash.site/reset-password?oobCode=${oobCode}`;
-
-        console.log("Frontend Link:", frontendResetLink);
-
-        // Send email
-        const mailOptions = {
-          from: `"Obokash Hotel Management Software" <${process.env.EMAIL_USER}>`,
-          to: email,
-          subject: "Reset Your Password",
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2>Password Reset Request</h2>
-              <p>Hello,</p>
-              <p>We received a request to reset the password for your account.</p>
-              <p>Click the button below to reset your password:</p>
-              <a href="${frontendResetLink}" 
-                style="display: inline-block; padding: 12px 24px; background-color: #0d9488; 
-                        color: white; text-decoration: none; border-radius: 6px; margin: 16px 0;">
-                Reset Password
-              </a>
-              <p>Or copy and paste this link into your browser:</p>
-              <p style="word-break: break-all; color: #0d9488;">${frontendResetLink}</p>
-              <p>This link will expire in 1 hour.</p>
-              <p>If you didn't request this, you can safely ignore this email.</p>
-              <br/>
-              <p style="color: #666; font-size: 13px;">— Obokash Hotel Management Software</p>
-            </div>
-          `,
-        };
-
-        await transporter.sendMail(mailOptions);
-
-        res.status(200).send({
-          message: "If this email exists, a password reset link has been sent.",
-        });
-      } catch (error) {
-  
-  console.error("Firebase Auth Error Detail:", JSON.stringify(error, null, 2));
-  return res.status(500).json({ success: false, error: error.message });
-}
+    // Send email in background (don’t await)
+    transporter.sendMail({
+      from: `"Obokash Hotel Management Software" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: "Reset Your Password",
+      html: `... your existing HTML with ${frontendResetLink} ...`,
+    }).catch(err => {
+      console.error("Background email failed:", err);
     });
+
+  } catch (error) {
+    console.error("Firebase Auth Error Detail:", JSON.stringify(error, null, 2));
+    // still return generic message so we never leak info
+    res.status(200).send({
+      message: "If this email exists, a password reset link has been sent.",
+    });
+  }
+});
+
+
 
     const verifyToken = (req, res, next) => {
       const authHeader = req.headers.authorization;
